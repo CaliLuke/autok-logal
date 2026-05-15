@@ -1,0 +1,8 @@
+dist/
+.tmp/
+*.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.dylib
+*.so

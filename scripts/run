@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+AUTOK_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
+
+FLUENT_BIT_BIN="${AUTOK_LOGAL_FLUENT_BIT_BIN:-fluent-bit}"
+PLUGIN_PATH="${AUTOK_LOGAL_PLUGIN_PATH:-$ROOT_DIR/dist/out_autok_sqlite.so}"
+CONFIG_PATH="${AUTOK_LOGAL_CONFIG_PATH:-$ROOT_DIR/config/fluent-bit.conf}"
+export AUTOK_LOGAL_DB_PATH="${AUTOK_LOGAL_DB_PATH:-$AUTOK_ROOT/otel.debug.sqlite}"
+export AUTOK_LOGAL_STORAGE_PATH="${AUTOK_LOGAL_STORAGE_PATH:-$AUTOK_ROOT/.tmp/logal-buffer}"
+export AUTOK_LOGAL_RETENTION_HOURS="${AUTOK_LOGAL_RETENTION_HOURS:-48}"
+
+if [[ "${1:-}" == "--dry-run" ]]; then
+  if ! command -v "$FLUENT_BIT_BIN" >/dev/null; then
+    echo "missing fluent-bit binary: $FLUENT_BIT_BIN" >&2
+    echo "install with: brew install fluent-bit" >&2
+    exit 127
+  fi
+  test -f "$CONFIG_PATH"
+  echo "fluent-bit=$FLUENT_BIT_BIN"
+  echo "plugin=$PLUGIN_PATH"
+  echo "config=$CONFIG_PATH"
+  echo "db=$AUTOK_LOGAL_DB_PATH"
+  echo "buffer=$AUTOK_LOGAL_STORAGE_PATH"
+  exit 0
+fi
+
+if ! command -v "$FLUENT_BIT_BIN" >/dev/null; then
+  echo "fluent-bit is not installed. Install it with: brew install fluent-bit" >&2
+  exit 127
+fi
+
+if [[ ! -f "$PLUGIN_PATH" ]]; then
+  "$ROOT_DIR/scripts/build-plugin" >/dev/null
+fi
+
+mkdir -p "$AUTOK_LOGAL_STORAGE_PATH"
+
+exec "$FLUENT_BIT_BIN" -e "$PLUGIN_PATH" -c "$CONFIG_PATH" "$@"
