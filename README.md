@@ -22,7 +22,8 @@ Fluent Bit is the collector and buffer. The plugin is only the final SQLite sink
 
 | Port | Purpose |
 | --- | --- |
-| `4318` | OTLP HTTP input, including `/v1/logs` and `/v1/traces` when supported by the installed Fluent Bit build |
+| `4318` | Browser-facing OTLP HTTP input with local CORS handling for `/v1/logs` and `/v1/traces` |
+| `4319` | Internal Fluent Bit OTLP HTTP input behind the local CORS proxy |
 | `3847` | frontend debug log compatibility input |
 | `3848` | admin debug log compatibility input |
 | `2020` | Fluent Bit health/metrics HTTP server |
@@ -64,6 +65,9 @@ AUTOK_LOGAL_DB_PATH=/Users/luca/code/autok/otel.debug.sqlite
 AUTOK_LOGAL_STORAGE_PATH=/Users/luca/code/autok/.tmp/logal-buffer
 AUTOK_LOGAL_RETENTION_HOURS=48
 AUTOK_LOGAL_FLUENT_BIT_BIN=fluent-bit
+AUTOK_LOGAL_OTLP_EXTERNAL_PORT=4318
+AUTOK_LOGAL_OTLP_INTERNAL_PORT=4319
+AUTOK_LOGAL_OTLP_CORS_ORIGINS=https://localhost:3000,http://localhost:3000
 ```
 
 ## Query

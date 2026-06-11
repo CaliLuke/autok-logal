@@ -10,11 +10,17 @@ CONFIG_PATH="${AUTOK_LOGAL_CONFIG_PATH:-$ROOT_DIR/config/fluent-bit.conf}"
 export AUTOK_LOGAL_DB_PATH="${AUTOK_LOGAL_DB_PATH:-$AUTOK_ROOT/otel.debug.sqlite}"
 export AUTOK_LOGAL_STORAGE_PATH="${AUTOK_LOGAL_STORAGE_PATH:-$AUTOK_ROOT/.tmp/logal-buffer}"
 export AUTOK_LOGAL_RETENTION_HOURS="${AUTOK_LOGAL_RETENTION_HOURS:-48}"
+export AUTOK_LOGAL_OTLP_EXTERNAL_PORT="${AUTOK_LOGAL_OTLP_EXTERNAL_PORT:-4318}"
+export AUTOK_LOGAL_OTLP_INTERNAL_PORT="${AUTOK_LOGAL_OTLP_INTERNAL_PORT:-4319}"
 
 if [[ "${1:-}" == "--dry-run" ]]; then
   if ! command -v "$FLUENT_BIT_BIN" >/dev/null; then
     echo "missing fluent-bit binary: $FLUENT_BIT_BIN" >&2
     echo "install with: brew install fluent-bit" >&2
+    exit 127
+  fi
+  if ! command -v bun >/dev/null; then
+    echo "missing bun binary" >&2
     exit 127
   fi
   test -f "$CONFIG_PATH"
@@ -23,11 +29,18 @@ if [[ "${1:-}" == "--dry-run" ]]; then
   echo "config=$CONFIG_PATH"
   echo "db=$AUTOK_LOGAL_DB_PATH"
   echo "buffer=$AUTOK_LOGAL_STORAGE_PATH"
+  echo "otlp_external_port=$AUTOK_LOGAL_OTLP_EXTERNAL_PORT"
+  echo "otlp_internal_port=$AUTOK_LOGAL_OTLP_INTERNAL_PORT"
   exit 0
 fi
 
 if ! command -v "$FLUENT_BIT_BIN" >/dev/null; then
   echo "fluent-bit is not installed. Install it with: brew install fluent-bit" >&2
+  exit 127
+fi
+
+if ! command -v bun >/dev/null; then
+  echo "bun is not installed and is required for the local OTLP CORS proxy" >&2
   exit 127
 fi
 
@@ -37,4 +50,29 @@ fi
 
 mkdir -p "$AUTOK_LOGAL_STORAGE_PATH"
 
-exec "$FLUENT_BIT_BIN" -e "$PLUGIN_PATH" -c "$CONFIG_PATH" "$@"
+FLUENT_BIT_PID=""
+bun "$ROOT_DIR/scripts/otlp-cors-proxy.ts" &
+PROXY_PID="$!"
+sleep 0.2
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+  echo "failed to start OTLP CORS proxy on port $AUTOK_LOGAL_OTLP_EXTERNAL_PORT" >&2
+  exit 1
+fi
+
+cleanup() {
+  kill "$PROXY_PID" 2>/dev/null || true
+  if [[ -n "$FLUENT_BIT_PID" ]]; then
+    kill "$FLUENT_BIT_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+"$FLUENT_BIT_BIN" -e "$PLUGIN_PATH" -c "$CONFIG_PATH" "$@" &
+FLUENT_BIT_PID="$!"
+if wait "$FLUENT_BIT_PID"; then
+  STATUS=0
+else
+  STATUS="$?"
+fi
+cleanup
+exit "$STATUS"
