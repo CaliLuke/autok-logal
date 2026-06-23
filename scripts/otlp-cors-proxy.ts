@@ -32,7 +32,12 @@ function cleanForwardHeaders(request: Request): Headers {
   headers.delete("host");
   headers.delete("origin");
   headers.delete("referer");
+  headers.set("connection", "close");
   return headers;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 Bun.serve({
@@ -52,11 +57,20 @@ Bun.serve({
     upstreamUrl.hostname = "127.0.0.1";
     upstreamUrl.port = String(internalPort);
 
-    const upstreamResponse = await fetch(upstreamUrl, {
-      method: request.method,
-      headers: cleanForwardHeaders(request),
-      body: request.body,
-    });
+    let upstreamResponse: Response;
+    try {
+      upstreamResponse = await fetch(upstreamUrl, {
+        method: request.method,
+        headers: cleanForwardHeaders(request),
+        body: request.body,
+      });
+    } catch (error) {
+      console.warn(`OTLP proxy upstream ${request.method} ${upstreamUrl.pathname} failed: ${errorMessage(error)}`);
+      return new Response("OTLP upstream unavailable\n", {
+        status: 502,
+        headers: corsHeaders(origin),
+      });
+    }
 
     const headers = new Headers(upstreamResponse.headers);
     for (const [key, value] of Object.entries(corsHeaders(origin))) {

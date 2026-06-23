@@ -245,12 +245,18 @@ func decodeRecords(data unsafe.Pointer, length int, tag string) ([]logRecord, er
 }
 
 func expandRecord(record map[string]any) []map[string]any {
+	if len(record) == 0 {
+		return nil
+	}
+	if expanded := expandOTLPResourceLogs(record); len(expanded) > 0 {
+		return expanded
+	}
 	for _, key := range []string{"logRecords", "logs", "records"} {
 		if entries, ok := record[key].([]any); ok {
 			expanded := make([]map[string]any, 0, len(entries))
 			for _, entry := range entries {
 				if mapped, ok := entry.(map[string]any); ok {
-					expanded = append(expanded, mapped)
+					expanded = append(expanded, mergeRecordContext(record, mapped))
 				}
 			}
 			if len(expanded) > 0 {
@@ -258,18 +264,35 @@ func expandRecord(record map[string]any) []map[string]any {
 			}
 		}
 	}
+	if isOTLPNonLogEnvelope(record) {
+		return nil
+	}
+	if !hasLogBody(record) && hasAnyKey(record, "resource", "scope") {
+		return nil
+	}
 	return []map[string]any{record}
 }
 
 func toLogRecord(ts any, tag string, record map[string]any) logRecord {
 	attributes := mergeMaps(map[string]any{}, mapValue(record, "attributes"))
-	resource := mergeMaps(map[string]any{}, mapValue(record, "resource"))
+	resource := resourceValue(record)
 	body := firstNonEmpty(stringValue(record, "body"), stringValue(record, "message"), stringValue(record, "log"), stringValue(record, "event"), stringValue(record, "op"), "log")
 	op := firstNonEmpty(stringValue(record, "op"), stringValue(attributes, "event.action"), stringValue(record, "event"), body)
-	component := firstNonEmpty(stringValue(record, "component"), stringValue(attributes, "app.component"), tag)
+	serviceName := stringValue(resource, "service.name")
+	component := firstNonEmpty(stringValue(record, "component"), stringValue(attributes, "app.component"), serviceName, tag)
 	severityText := strings.ToUpper(firstNonEmpty(stringValue(record, "severity_text"), stringValue(record, "severityText"), stringValue(record, "level"), "INFO"))
-	timestamp := firstNonEmpty(stringValue(record, "timestamp"), stringValue(record, "time"), fluentTimestamp(ts), time.Now().UTC().Format(time.RFC3339Nano))
-	observedTimestamp := firstNonEmpty(stringValue(record, "observed_timestamp"), stringValue(record, "observedTimeUnixNano"), timestamp)
+	timestamp := firstNonEmpty(
+		timestampValue(record, "timestamp"),
+		timestampValue(record, "time"),
+		timestampValue(record, "timeUnixNano"),
+		fluentTimestamp(ts),
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	observedTimestamp := firstNonEmpty(
+		timestampValue(record, "observed_timestamp"),
+		timestampValue(record, "observedTimeUnixNano"),
+		timestamp,
+	)
 
 	if _, ok := resource["service.name"]; !ok {
 		resource["service.name"] = serviceNameForTag(tag)
@@ -291,9 +314,73 @@ func toLogRecord(ts any, tag string, record map[string]any) logRecord {
 		Op:                nullString(op),
 		AttributesJSON:    mustJSON(mergeMaps(record, map[string]any{"attributes": attributes})),
 		ResourceJSON:      mustJSON(resource),
-		ScopeName:         nullString(firstNonEmpty(stringValue(record, "scope_name"), stringValue(record, "scopeName"), tag)),
+		ScopeName:         nullString(firstNonEmpty(stringValue(record, "scope_name"), stringValue(record, "scopeName"), stringValue(mapValue(record, "scope"), "name"), tag)),
 		ScopeVersion:      nullString(firstNonEmpty(stringValue(record, "scope_version"), stringValue(record, "scopeVersion"))),
 	}
+}
+
+func expandOTLPResourceLogs(record map[string]any) []map[string]any {
+	resourceLogs, ok := record["resourceLogs"].([]any)
+	if !ok {
+		return nil
+	}
+
+	var expanded []map[string]any
+	for _, resourceLog := range resourceLogs {
+		resourceLogMap, ok := resourceLog.(map[string]any)
+		if !ok {
+			continue
+		}
+		scopeLogs, _ := resourceLogMap["scopeLogs"].([]any)
+		for _, scopeLog := range scopeLogs {
+			scopeLogMap, ok := scopeLog.(map[string]any)
+			if !ok {
+				continue
+			}
+			logRecords, _ := scopeLogMap["logRecords"].([]any)
+			for _, entry := range logRecords {
+				entryMap, ok := entry.(map[string]any)
+				if !ok {
+					continue
+				}
+				expanded = append(expanded, mergeRecordContext(mergeRecordContext(resourceLogMap, scopeLogMap), entryMap))
+			}
+		}
+	}
+	return expanded
+}
+
+func mergeRecordContext(parent map[string]any, child map[string]any) map[string]any {
+	merged := mergeMaps(parent, child)
+	if _, ok := child["resource"]; !ok {
+		if resource := mapValue(parent, "resource"); len(resource) > 0 {
+			merged["resource"] = resource
+		}
+	}
+	if _, ok := child["scope"]; !ok {
+		if scope := mapValue(parent, "scope"); len(scope) > 0 {
+			merged["scope"] = scope
+		}
+	}
+	return merged
+}
+
+func isOTLPNonLogEnvelope(record map[string]any) bool {
+	for _, key := range []string{"resourceSpans", "scopeSpans", "spans", "resourceMetrics", "scopeMetrics", "metrics"} {
+		if _, ok := record[key]; ok {
+			return !hasLogBody(record)
+		}
+	}
+	return false
+}
+
+func hasLogBody(record map[string]any) bool {
+	for _, key := range []string{"body", "message", "log", "event", "op"} {
+		if stringValue(record, key) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeMap(input map[interface{}]interface{}) map[string]any {
@@ -329,7 +416,55 @@ func mapValue(record map[string]any, key string) map[string]any {
 	if mapped, ok := value.(map[string]any); ok {
 		return mapped
 	}
+	if entries, ok := value.([]any); ok {
+		return keyValueList(entries)
+	}
 	return map[string]any{}
+}
+
+func keyValueList(entries []any) map[string]any {
+	out := make(map[string]any, len(entries))
+	for _, entry := range entries {
+		mapped, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		key := stringValue(mapped, "key")
+		if key == "" {
+			continue
+		}
+		if value, ok := mapped["value"]; ok {
+			out[key] = normalizeOTLPAnyValue(value)
+		}
+	}
+	return out
+}
+
+func normalizeOTLPAnyValue(value any) any {
+	mapped, ok := value.(map[string]any)
+	if !ok {
+		return value
+	}
+	for _, key := range []string{"stringValue", "intValue", "doubleValue", "boolValue", "bytesValue"} {
+		if scalar, ok := mapped[key]; ok {
+			return scalar
+		}
+	}
+	if nested, ok := mapped["arrayValue"]; ok {
+		return nested
+	}
+	if nested, ok := mapped["kvlistValue"]; ok {
+		return nested
+	}
+	return value
+}
+
+func resourceValue(record map[string]any) map[string]any {
+	resource := mergeMaps(map[string]any{}, mapValue(record, "resource"))
+	if attrs := mapValue(resource, "attributes"); len(attrs) > 0 {
+		resource = mergeMaps(resource, attrs)
+	}
+	return resource
 }
 
 func stringValue(record map[string]any, key string) string {
@@ -340,6 +475,16 @@ func stringValue(record map[string]any, key string) string {
 	switch v := value.(type) {
 	case string:
 		return strings.TrimSpace(v)
+	case map[string]any:
+		for _, key := range []string{"stringValue", "intValue", "doubleValue", "boolValue", "bytesValue"} {
+			if nested := stringValue(v, key); nested != "" {
+				return nested
+			}
+		}
+		if nested := stringValue(v, "value"); nested != "" {
+			return nested
+		}
+		return ""
 	case fmt.Stringer:
 		return strings.TrimSpace(v.String())
 	case json.Number:
@@ -349,6 +494,52 @@ func stringValue(record map[string]any, key string) string {
 	default:
 		return ""
 	}
+}
+
+func hasAnyKey(record map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := record[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func timestampValue(record map[string]any, key string) string {
+	value, ok := record[key]
+	if !ok || value == nil {
+		return ""
+	}
+	if text := stringValue(record, key); text != "" {
+		if parsed := unixNanoTimestamp(text); parsed != "" {
+			return parsed
+		}
+		return text
+	}
+	switch v := value.(type) {
+	case int:
+		return unixNanoTimestamp(strconv.FormatInt(int64(v), 10))
+	case int64:
+		return unixNanoTimestamp(strconv.FormatInt(v, 10))
+	case uint64:
+		return unixNanoTimestamp(strconv.FormatUint(v, 10))
+	case float64:
+		return unixNanoTimestamp(strconv.FormatInt(int64(v), 10))
+	default:
+		return ""
+	}
+}
+
+func unixNanoTimestamp(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) < 16 {
+		return ""
+	}
+	nanos, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || nanos <= 0 {
+		return ""
+	}
+	return time.Unix(0, nanos).UTC().Format(time.RFC3339Nano)
 }
 
 func intValue(record map[string]any, key string) int {
