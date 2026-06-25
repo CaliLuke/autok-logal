@@ -25,6 +25,24 @@ const (
 	defaultRetentionHours = 48
 )
 
+var requiredLogColumns = []string{
+	"timestamp",
+	"observed_timestamp",
+	"trace_id",
+	"span_id",
+	"request_id",
+	"product_id",
+	"severity_text",
+	"severity_number",
+	"body",
+	"component",
+	"op",
+	"attributes_json",
+	"resource_json",
+	"scope_name",
+	"scope_version",
+}
+
 type pluginContext struct {
 	db             *sql.DB
 	retentionHours int
@@ -79,7 +97,8 @@ func FLBPluginFlushCtx(ctxPtr unsafe.Pointer, data unsafe.Pointer, length C.int,
 	defer ctx.mu.Unlock()
 
 	if err := ctx.insert(records); err != nil {
-		fmt.Fprintf(os.Stderr, "[autok_sqlite] insert failed, asking Fluent Bit to retry: %v\n", err)
+		ctx.recordSinkError("insert", err, records)
+		fmt.Fprintf(os.Stderr, "[autok_sqlite] insert failed for %d record(s), asking Fluent Bit to retry: %v\n", len(records), err)
 		return output.FLB_RETRY
 	}
 	return output.FLB_OK
@@ -98,7 +117,7 @@ type logRecord struct {
 	TraceID           sql.NullString
 	SpanID            sql.NullString
 	RequestID         sql.NullString
-	ProjectID         sql.NullString
+	ProductID         sql.NullString
 	SeverityText      string
 	SeverityNumber    int
 	Body              string
@@ -142,7 +161,7 @@ func (ctx *pluginContext) initSchema() error {
 			trace_id TEXT,
 			span_id TEXT,
 			request_id TEXT,
-			project_id TEXT,
+			product_id TEXT,
 			severity_text TEXT NOT NULL,
 			severity_number INTEGER NOT NULL,
 			body TEXT NOT NULL,
@@ -157,19 +176,80 @@ func (ctx *pluginContext) initSchema() error {
 		`CREATE INDEX IF NOT EXISTS idx_otel_logs_severity_text ON otel_logs(severity_text)`,
 		`CREATE INDEX IF NOT EXISTS idx_otel_logs_trace_id ON otel_logs(trace_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_otel_logs_request_id ON otel_logs(request_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_otel_logs_project_id ON otel_logs(project_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_otel_logs_component ON otel_logs(component)`,
 		`CREATE INDEX IF NOT EXISTS idx_otel_logs_op ON otel_logs(op)`,
 		`CREATE INDEX IF NOT EXISTS idx_otel_logs_body ON otel_logs(body)`,
 		`DROP VIEW IF EXISTS logs`,
 		`CREATE VIEW IF NOT EXISTS logs AS SELECT * FROM otel_logs`,
+		`CREATE TABLE IF NOT EXISTS autok_logal_errors (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			occurred_at TEXT NOT NULL,
+			phase TEXT NOT NULL,
+			message TEXT NOT NULL,
+			record_count INTEGER NOT NULL,
+			sample_json TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_autok_logal_errors_occurred_at ON autok_logal_errors(occurred_at)`,
 	}
 	for _, statement := range statements {
 		if _, err := ctx.db.Exec(statement); err != nil {
 			return err
 		}
 	}
+	return ctx.migrateLogSchema()
+}
+
+func (ctx *pluginContext) migrateLogSchema() error {
+	columns, err := ctx.logColumns()
+	if err != nil {
+		return err
+	}
+	if _, ok := columns["product_id"]; !ok {
+		if _, ok := columns["project_id"]; ok {
+			if _, err := ctx.db.Exec(`ALTER TABLE otel_logs ADD COLUMN product_id TEXT`); err != nil {
+				return fmt.Errorf("add product_id column: %w", err)
+			}
+			if _, err := ctx.db.Exec(`UPDATE otel_logs SET product_id = project_id WHERE product_id IS NULL OR product_id = ''`); err != nil {
+				return fmt.Errorf("backfill product_id from project_id: %w", err)
+			}
+			columns["product_id"] = true
+		}
+	}
+	for _, column := range requiredLogColumns {
+		if !columns[column] {
+			return fmt.Errorf("otel_logs is missing required column %q", column)
+		}
+	}
+	if _, err := ctx.db.Exec(`CREATE INDEX IF NOT EXISTS idx_otel_logs_product_id ON otel_logs(product_id)`); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (ctx *pluginContext) logColumns() (map[string]bool, error) {
+	rows, err := ctx.db.Query(`PRAGMA table_info(otel_logs)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name string
+		var columnType string
+		var notNull int
+		var defaultValue sql.NullString
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return columns, nil
 }
 
 func (ctx *pluginContext) insert(records []logRecord) error {
@@ -183,7 +263,7 @@ func (ctx *pluginContext) insert(records []logRecord) error {
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO otel_logs (
-			timestamp, observed_timestamp, trace_id, span_id, request_id, project_id,
+			timestamp, observed_timestamp, trace_id, span_id, request_id, product_id,
 			severity_text, severity_number, body, component, op,
 			attributes_json, resource_json, scope_name, scope_version
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -200,7 +280,7 @@ func (ctx *pluginContext) insert(records []logRecord) error {
 			record.TraceID,
 			record.SpanID,
 			record.RequestID,
-			record.ProjectID,
+			record.ProductID,
 			record.SeverityText,
 			record.SeverityNumber,
 			record.Body,
@@ -222,6 +302,23 @@ func (ctx *pluginContext) insert(records []logRecord) error {
 	}
 
 	return tx.Commit()
+}
+
+func (ctx *pluginContext) recordSinkError(phase string, err error, records []logRecord) {
+	sampleJSON := ""
+	if len(records) > 0 {
+		sampleJSON = mustJSON(records[0])
+	}
+	if _, writeErr := ctx.db.Exec(
+		`INSERT INTO autok_logal_errors (occurred_at, phase, message, record_count, sample_json) VALUES (?, ?, ?, ?, ?)`,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		phase,
+		err.Error(),
+		len(records),
+		nullString(sampleJSON),
+	); writeErr != nil {
+		fmt.Fprintf(os.Stderr, "[autok_sqlite] failed to record sink error: %v\n", writeErr)
+	}
 }
 
 func decodeRecords(data unsafe.Pointer, length int, tag string) ([]logRecord, error) {
@@ -306,7 +403,7 @@ func toLogRecord(ts any, tag string, record map[string]any) logRecord {
 		TraceID:           nullString(firstNonEmpty(stringValue(record, "trace_id"), stringValue(record, "traceId"), stringValue(attributes, "trace.id"))),
 		SpanID:            nullString(firstNonEmpty(stringValue(record, "span_id"), stringValue(record, "spanId"), stringValue(attributes, "span.id"))),
 		RequestID:         nullString(firstNonEmpty(stringValue(record, "request_id"), stringValue(record, "requestId"), stringValue(attributes, "request_id"), stringValue(attributes, "requestId"))),
-		ProjectID:         nullString(firstNonEmpty(stringValue(record, "project_id"), stringValue(record, "projectId"), stringValue(attributes, "project_id"), stringValue(attributes, "projectId"))),
+		ProductID:         nullString(firstNonEmpty(stringValue(record, "product_id"), stringValue(record, "productId"), stringValue(attributes, "product_id"), stringValue(attributes, "productId"), stringValue(record, "project_id"), stringValue(record, "projectId"), stringValue(attributes, "project_id"), stringValue(attributes, "projectId"))),
 		SeverityText:      severityText,
 		SeverityNumber:    severityNumber(severityText, intValue(record, "severity_number"), intValue(record, "severityNumber")),
 		Body:              body,

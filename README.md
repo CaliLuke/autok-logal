@@ -58,6 +58,18 @@ From the Auto-K parent repo:
 ./dev-traces
 ```
 
+The normal dev stack starts Logal through `stack.toml` with the same `./scripts/run`
+entrypoint. The script keeps the OTLP CORS proxy and Fluent Bit tied together:
+if either child exits, the script exits so `stack` can show the service as
+failed instead of leaving a half-working collector behind.
+
+For manual background runs outside `stack`:
+
+```bash
+./scripts/run --daemon
+tail -f ../.tmp/autok-logal.log
+```
+
 Useful environment overrides:
 
 ```bash
@@ -75,14 +87,19 @@ AUTOK_LOGAL_OTLP_CORS_ORIGINS=https://localhost:3000,http://localhost:3000
 ```bash
 sqlite3 ../otel.debug.sqlite "SELECT timestamp, severity_text, component, op, body, trace_id FROM otel_logs ORDER BY id DESC LIMIT 20"
 sqlite3 ../otel.debug.sqlite "SELECT timestamp, json_extract(resource_json, '$.\"service.name\"') AS service_name, severity_text, body FROM otel_logs ORDER BY id DESC LIMIT 20"
+sqlite3 ../otel.debug.sqlite "SELECT occurred_at, phase, message, record_count FROM autok_logal_errors ORDER BY id DESC LIMIT 20"
 ```
 
 ## Schema
 
 The plugin writes the shared `otel_logs` table used by Auto-K debugging:
 
-- indexed correlation columns: `trace_id`, `span_id`, `request_id`, `project_id`
+- indexed correlation columns: `trace_id`, `span_id`, `request_id`, `product_id`
 - indexed triage columns: `timestamp`, `severity_text`, `component`, `op`, `body`
 - raw context columns: `attributes_json`, `resource_json`
 
 It also creates a `logs` view for older local queries.
+
+The plugin repairs the old local `project_id` column shape by adding and
+backfilling `product_id` before ingest. If SQLite writes fail after startup, the
+plugin records the failure in `autok_logal_errors` and asks Fluent Bit to retry.

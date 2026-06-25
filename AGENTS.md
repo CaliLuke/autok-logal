@@ -21,7 +21,7 @@ If Fluent Bit is installed locally, also run:
 
 ```bash
 ./scripts/run
-curl -s http://127.0.0.1:2020/api/v1/health
+curl -s http://127.0.0.1:2020/api/v1/uptime
 ```
 
 Do not add generated binaries under `dist/` to git.
