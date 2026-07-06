@@ -7,6 +7,9 @@ OUT_FILE="$OUT_DIR/out_autok_sqlite.so"
 
 mkdir -p "$OUT_DIR"
 
-CGO_ENABLED=1 go build -buildmode=c-shared -o "$OUT_FILE" ./cmd/out_autok_sqlite
+(
+  cd "$ROOT_DIR"
+  CGO_ENABLED=1 go build -buildmode=c-shared -o "$OUT_FILE" ./cmd/out_autok_sqlite
+)
 
 echo "$OUT_FILE"
