@@ -3,126 +3,25 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 AUTOK_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
+BINARY_PATH="${AUTOK_LOGAL_BINARY_PATH:-$ROOT_DIR/bin/logal}"
+CONFIG_PATH="${AUTOK_LOGAL_CONFIG_PATH:-$ROOT_DIR/config/local.yaml}"
 
-FLUENT_BIT_BIN="${AUTOK_LOGAL_FLUENT_BIT_BIN:-fluent-bit}"
-PLUGIN_PATH="${AUTOK_LOGAL_PLUGIN_PATH:-$ROOT_DIR/dist/out_autok_sqlite.so}"
-CONFIG_PATH="${AUTOK_LOGAL_CONFIG_PATH:-$ROOT_DIR/config/fluent-bit.conf}"
-LOG_PATH="${AUTOK_LOGAL_LOG_PATH:-$AUTOK_ROOT/.tmp/autok-logal.log}"
-PID_PATH="${AUTOK_LOGAL_PID_PATH:-$AUTOK_ROOT/.tmp/autok-logal.pid}"
 export AUTOK_LOGAL_DB_PATH="${AUTOK_LOGAL_DB_PATH:-$AUTOK_ROOT/otel.debug.sqlite}"
-export AUTOK_LOGAL_STORAGE_PATH="${AUTOK_LOGAL_STORAGE_PATH:-$AUTOK_ROOT/.tmp/logal-buffer}"
 export AUTOK_LOGAL_RETENTION_HOURS="${AUTOK_LOGAL_RETENTION_HOURS:-48}"
-export AUTOK_LOGAL_OTLP_EXTERNAL_PORT="${AUTOK_LOGAL_OTLP_EXTERNAL_PORT:-4318}"
-export AUTOK_LOGAL_OTLP_INTERNAL_PORT="${AUTOK_LOGAL_OTLP_INTERNAL_PORT:-4319}"
-
-if [[ "${1:-}" == "--daemon" ]]; then
-  shift
-  mkdir -p "$(dirname "$LOG_PATH")" "$(dirname "$PID_PATH")"
-  if [[ -f "$PID_PATH" ]]; then
-    EXISTING_PID="$(cat "$PID_PATH")"
-    if [[ -n "$EXISTING_PID" ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
-      echo "autok-logal is already running with pid $EXISTING_PID" >&2
-      exit 1
-    fi
-  fi
-  nohup "$0" "$@" >"$LOG_PATH" 2>&1 &
-  CHILD_PID="$!"
-  echo "$CHILD_PID" >"$PID_PATH"
-  echo "autok-logal started with pid $CHILD_PID"
-  echo "log=$LOG_PATH"
-  exit 0
-fi
+export AUTOK_LOGAL_OTLP_PORT="${AUTOK_LOGAL_OTLP_PORT:-4318}"
+export AUTOK_LOGAL_HEALTH_PORT="${AUTOK_LOGAL_HEALTH_PORT:-13133}"
 
 if [[ "${1:-}" == "--dry-run" ]]; then
-  if ! command -v "$FLUENT_BIT_BIN" >/dev/null; then
-    echo "missing fluent-bit binary: $FLUENT_BIT_BIN" >&2
-    echo "install with: brew install fluent-bit" >&2
-    exit 127
-  fi
-  if ! command -v bun >/dev/null; then
-    echo "missing bun binary" >&2
-    exit 127
-  fi
   test -f "$CONFIG_PATH"
-  echo "fluent-bit=$FLUENT_BIT_BIN"
-  echo "plugin=$PLUGIN_PATH"
+  echo "binary=$BINARY_PATH"
   echo "config=$CONFIG_PATH"
   echo "db=$AUTOK_LOGAL_DB_PATH"
-  echo "buffer=$AUTOK_LOGAL_STORAGE_PATH"
-  echo "log=$LOG_PATH"
-  echo "pid=$PID_PATH"
-  echo "otlp_external_port=$AUTOK_LOGAL_OTLP_EXTERNAL_PORT"
-  echo "otlp_internal_port=$AUTOK_LOGAL_OTLP_INTERNAL_PORT"
+  echo "otlp_port=$AUTOK_LOGAL_OTLP_PORT"
+  echo "health_port=$AUTOK_LOGAL_HEALTH_PORT"
   exit 0
 fi
 
-if ! command -v "$FLUENT_BIT_BIN" >/dev/null; then
-  echo "fluent-bit is not installed. Install it with: brew install fluent-bit" >&2
-  exit 127
-fi
-
-if ! command -v bun >/dev/null; then
-  echo "bun is not installed and is required for the local OTLP CORS proxy" >&2
-  exit 127
-fi
-
-if [[ ! -f "$PLUGIN_PATH" ]]; then
-  "$ROOT_DIR/scripts/build-plugin" >/dev/null
-fi
-
-mkdir -p "$AUTOK_LOGAL_STORAGE_PATH" "$(dirname "$PID_PATH")"
-echo "$$" >"$PID_PATH"
-
-FLUENT_BIT_PID=""
-PROXY_PID=""
-STOPPING=0
-bun "$ROOT_DIR/scripts/otlp-cors-proxy.ts" &
-PROXY_PID="$!"
-sleep 0.2
-if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-  echo "failed to start OTLP CORS proxy on port $AUTOK_LOGAL_OTLP_EXTERNAL_PORT" >&2
-  exit 1
-fi
-
-cleanup() {
-  STOPPING=1
-  if [[ -n "$PROXY_PID" ]]; then
-    kill "$PROXY_PID" 2>/dev/null || true
-  fi
-  if [[ -n "$FLUENT_BIT_PID" ]]; then
-    kill "$FLUENT_BIT_PID" 2>/dev/null || true
-  fi
-  if [[ -f "$PID_PATH" ]] && [[ "$(cat "$PID_PATH")" == "$$" ]]; then
-    rm -f "$PID_PATH"
-  fi
-}
-trap cleanup EXIT INT TERM
-
-"$FLUENT_BIT_BIN" -e "$PLUGIN_PATH" -c "$CONFIG_PATH" "$@" &
-FLUENT_BIT_PID="$!"
-
-while true; do
-  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-    wait "$PROXY_PID" || STATUS="$?"
-    STATUS="${STATUS:-1}"
-    if [[ "$STOPPING" -eq 0 ]]; then
-      echo "OTLP CORS proxy exited with status $STATUS; stopping Fluent Bit" >&2
-    fi
-    kill "$FLUENT_BIT_PID" 2>/dev/null || true
-    wait "$FLUENT_BIT_PID" 2>/dev/null || true
-    exit "$STATUS"
-  fi
-
-  if ! kill -0 "$FLUENT_BIT_PID" 2>/dev/null; then
-    wait "$FLUENT_BIT_PID" || STATUS="$?"
-    STATUS="${STATUS:-1}"
-    if [[ "$STOPPING" -eq 0 ]]; then
-      echo "Fluent Bit exited with status $STATUS; stopping OTLP CORS proxy" >&2
-    fi
-    kill "$PROXY_PID" 2>/dev/null || true
-    wait "$PROXY_PID" 2>/dev/null || true
-    exit "$STATUS"
-  fi
-
-  sleep 0.5
-done
+mkdir -p "$ROOT_DIR/bin" "$(dirname "$AUTOK_LOGAL_DB_PATH")"
+cd "$ROOT_DIR"
+go build -o "$BINARY_PATH" ./cmd/logal
+exec "$BINARY_PATH" --config "$CONFIG_PATH" "$@"

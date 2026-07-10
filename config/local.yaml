@@ -1,0 +1,44 @@
+extensions:
+  logal_store:
+    path: ${env:AUTOK_LOGAL_DB_PATH}
+    retention_hours: ${env:AUTOK_LOGAL_RETENTION_HOURS}
+  logal_status:
+    endpoint: 127.0.0.1:${env:AUTOK_LOGAL_HEALTH_PORT}
+    max_in_flight_requests: 8
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:${env:AUTOK_LOGAL_OTLP_PORT}
+        max_request_body_size: 4194304
+        middlewares:
+          - id: logal_status
+        cors:
+          allowed_origins:
+            - https://localhost:3000
+            - http://localhost:3000
+            - https://127.0.0.1:3000
+            - http://127.0.0.1:3000
+            - https://localhost:5173
+            - http://localhost:5173
+          allowed_headers: [content-type, traceparent, tracestate, baggage]
+
+exporters:
+  logal_sqlite/logs:
+    store: logal_store
+  logal_sqlite/traces:
+    store: logal_store
+
+service:
+  telemetry:
+    metrics:
+      level: none
+  extensions: [logal_store, logal_status]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [logal_sqlite/logs]
+    traces:
+      receivers: [otlp]
+      exporters: [logal_sqlite/traces]

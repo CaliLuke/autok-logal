@@ -1,27 +1,29 @@
 # autok-logal
 
-Local Auto-K logging collector. Keep implementation here rather than copying logger internals into the app repos.
+Local Auto-K OpenTelemetry collector. Keep persistence and lifecycle ownership here rather than copying SQLite writers into app repos.
 
 ## Scope
 
-- Fluent Bit owns ingestion, buffering, retry, and backpressure.
-- The `autok_sqlite` Fluent Bit output plugin is the only process that writes `otel.debug.sqlite`.
-- Auto-K apps should forward logs/traces to Fluent Bit ports, not open the SQLite database directly.
+- Logal is the only process that opens `otel.debug.sqlite` read-write.
+- Auto-K apps export signal-specific OTLP logs/traces and never open the database.
+- The database is disposable: reset stale/corrupt schemas instead of adding compatibility migrations.
+- Keep metrics unsupported until a separate metrics schema is designed.
 
 ## Validation
 
 Run these before considering logger changes complete:
 
 ```bash
-./scripts/build-plugin
+go test ./...
+go build ./cmd/logal
 ./scripts/run --dry-run
 ```
 
-If Fluent Bit is installed locally, also run:
+For live verification, also run:
 
 ```bash
 ./scripts/run
-curl -s http://127.0.0.1:2020/api/v1/uptime
+curl -fsS http://127.0.0.1:13133/readyz
 ```
 
 Do not add generated binaries under `dist/` to git.
