@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -303,6 +304,16 @@ func classifyDatabaseForInspection(path string) (owned bool, immutable bool, err
 		return true, true, nil
 	}
 	appID := int(binary.BigEndian.Uint32(contents[68:72]))
+	if appID == 0 {
+		if _, walErr := os.Stat(path + "-wal"); walErr == nil {
+			appID, err = inspectWALApplicationID(path)
+			if err != nil {
+				return false, false, err
+			}
+		} else if !errors.Is(walErr, os.ErrNotExist) {
+			return false, false, walErr
+		}
+	}
 	if appID != 0 && appID != applicationID {
 		return false, false, nil
 	}
@@ -317,6 +328,48 @@ func classifyDatabaseForInspection(path string) (owned bool, immutable bool, err
 		return true, true, nil
 	}
 	return true, false, nil
+}
+
+func inspectWALApplicationID(path string) (int, error) {
+	tempDir, err := os.MkdirTemp(filepath.Dir(path), ".logal-inspect-")
+	if err != nil {
+		return 0, err
+	}
+	defer os.RemoveAll(tempDir)
+	tempPath := filepath.Join(tempDir, filepath.Base(path))
+	for _, suffix := range []string{"", "-wal"} {
+		if err := copyInspectionFile(path+suffix, tempPath+suffix); err != nil {
+			return 0, err
+		}
+	}
+	db, err := sql.Open("sqlite3", tempPath+"?_busy_timeout=5000")
+	if err != nil {
+		return 0, err
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	var appID int
+	if err := db.QueryRow(`PRAGMA application_id`).Scan(&appID); err != nil {
+		return 0, err
+	}
+	return appID, nil
+}
+
+func copyInspectionFile(sourcePath, targetPath string) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(target, source); err != nil {
+		_ = target.Close()
+		return err
+	}
+	return target.Close()
 }
 
 func openInspectionDB(path string, immutable bool) (*sql.DB, error) {

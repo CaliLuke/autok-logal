@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -198,6 +199,44 @@ func TestStartDoesNotTouchForeignWALDatabase(t *testing.T) {
 	var value string
 	if err := db.QueryRow(`SELECT value FROM important`).Scan(&value); err != nil || value != "keep" {
 		t.Fatalf("foreign database was changed: value=%q err=%v", value, err)
+	}
+}
+
+func TestClassifyDatabaseReadsCommittedOwnershipFromWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "owned-wal.sqlite")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA application_id=%d; CREATE TABLE owned(value TEXT)`, applicationID)); err != nil {
+		t.Fatal(err)
+	}
+	database, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := int(binary.BigEndian.Uint32(database[68:72])); got != 0 {
+		t.Fatalf("test requires ownership only in WAL, main application_id=%d", got)
+	}
+	wal, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	owned, immutable, err := classifyDatabaseForInspection(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !owned || immutable {
+		t.Fatalf("WAL ownership not recognized: owned=%v immutable=%v", owned, immutable)
+	}
+	actual, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(actual, wal) {
+		t.Fatal("ownership inspection changed WAL")
 	}
 }
 
