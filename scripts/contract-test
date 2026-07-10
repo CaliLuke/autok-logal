@@ -36,7 +36,7 @@ curl -fsS "http://127.0.0.1:$HEALTH_PORT/readyz" >/dev/null
 
 curl -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/logs" \
   -H 'Content-Type: application/json' \
-  --data '{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeLogs":[{"logRecords":[{"severityNumber":9,"severityText":"INFO","body":{"kvlistValue":{"values":[{"key":"message","value":{"stringValue":"ready"}},{"key":"password","value":{"stringValue":"must-not-persist-body"}}]}},"attributes":[{"key":"authorization","value":{"stringValue":"Bearer must-not-persist"}}]}]}]}]}' >/dev/null
+  --data '{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeLogs":[{"logRecords":[{"severityNumber":9,"severityText":"INFO","body":{"kvlistValue":{"values":[{"key":"message","value":{"stringValue":"ready"}},{"key":"password","value":{"stringValue":"must-not-persist-body"}}]}},"attributes":[{"key":"authorization","value":{"stringValue":"Bearer must-not-persist"}},{"key":"event.name","value":{"stringValue":"contract.frontend.ready"}},{"key":"request.id","value":{"stringValue":"request-123"}},{"key":"autok.product.id","value":{"stringValue":"product-456"}},{"key":"app.component","value":{"stringValue":"frontend"}}]}]}]}]}' >/dev/null
 
 curl -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/traces" \
   -H 'Content-Type: application/json' \
@@ -50,6 +50,7 @@ test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE servi
 test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE payload_json LIKE '%must-not-persist%'")" = "0"
 test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE body_json LIKE '%must-not-persist%'")" = "0"
 test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE payload_json LIKE '%[REDACTED]%'")" = "1"
+test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE op='contract.frontend.ready' AND request_id='request-123' AND product_id='product-456' AND component='frontend'")" = "1"
 test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_spans WHERE service_name='contract'")" = "2"
 test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$OTLP_PORT/v1/metrics" -H 'Content-Type: application/json' --data '{}')" = "404"
 
