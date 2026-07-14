@@ -23,5 +23,31 @@ fi
 
 mkdir -p "$ROOT_DIR/bin" "$(dirname "$AUTOK_LOGAL_DB_PATH")"
 cd "$ROOT_DIR"
-go build -o "$BINARY_PATH" ./cmd/logal
+
+needs_build=false
+SOURCE_MANIFEST="${BINARY_PATH}.sources"
+build_inputs=()
+while IFS= read -r input; do
+  build_inputs+=("$input")
+done < <(
+  find "$ROOT_DIR" \( -path "$ROOT_DIR/.git" -o -path "$ROOT_DIR/bin" \) -prune -o \
+    -type f \( -name '*.go' -o -name 'go.mod' -o -name 'go.sum' \) -print | sort
+)
+if [[ ! -x "$BINARY_PATH" ]]; then
+  needs_build=true
+elif [[ ! -f "$SOURCE_MANIFEST" ]] || ! cmp -s <(printf '%s\n' "${build_inputs[@]}") "$SOURCE_MANIFEST"; then
+  needs_build=true
+else
+  for input in "${build_inputs[@]}"; do
+    if [[ "$input" -nt "$BINARY_PATH" ]]; then
+      needs_build=true
+      break
+    fi
+  done
+fi
+
+if [[ "$needs_build" == true ]]; then
+  go build -o "$BINARY_PATH" ./cmd/logal
+  printf '%s\n' "${build_inputs[@]}" > "$SOURCE_MANIFEST"
+fi
 exec "$BINARY_PATH" --config "$CONFIG_PATH" "$@"
