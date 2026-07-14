@@ -3,27 +3,62 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 AUTOK_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
-BINARY_PATH="${AUTOK_LOGAL_BINARY_PATH:-$ROOT_DIR/bin/logal}"
-CONFIG_PATH="${AUTOK_LOGAL_CONFIG_PATH:-$ROOT_DIR/config/local.yaml}"
+INVOCATION_DIR="$PWD"
 
-export AUTOK_LOGAL_DB_PATH="${AUTOK_LOGAL_DB_PATH:-$AUTOK_ROOT/otel.debug.sqlite}"
+absolute_path() {
+	if [[ "$1" == /* ]]; then
+		printf '%s\n' "$1"
+	else
+		printf '%s/%s\n' "$INVOCATION_DIR" "$1"
+	fi
+}
+
+BINARY_PATH="$(absolute_path "${AUTOK_LOGAL_BINARY_PATH:-$ROOT_DIR/bin/logal}")"
+CONFIG_PATH="$(absolute_path "${AUTOK_LOGAL_CONFIG_PATH:-$ROOT_DIR/config/local.yaml}")"
+
+AUTOK_LOGAL_DB_PATH="$(absolute_path "${AUTOK_LOGAL_DB_PATH:-$AUTOK_ROOT/otel.debug.sqlite}")"
+export AUTOK_LOGAL_DB_PATH
 export AUTOK_LOGAL_RETENTION_HOURS="${AUTOK_LOGAL_RETENTION_HOURS:-48}"
 export AUTOK_LOGAL_OTLP_PORT="${AUTOK_LOGAL_OTLP_PORT:-4318}"
 export AUTOK_LOGAL_HEALTH_PORT="${AUTOK_LOGAL_HEALTH_PORT:-13133}"
+WATCH="${AUTOK_LOGAL_WATCH:-1}"
 
 if [[ "${1:-}" == "--dry-run" ]]; then
-  test -f "$CONFIG_PATH"
-  echo "binary=$BINARY_PATH"
-  echo "config=$CONFIG_PATH"
-  echo "db=$AUTOK_LOGAL_DB_PATH"
-  echo "otlp_port=$AUTOK_LOGAL_OTLP_PORT"
-  echo "health_port=$AUTOK_LOGAL_HEALTH_PORT"
-  exit 0
+	test -f "$CONFIG_PATH"
+	if [[ "$WATCH" != "0" ]] && ! command -v air >/dev/null 2>&1; then
+		echo "air is required; install it with: go install github.com/air-verse/air@latest" >&2
+		exit 1
+	fi
+	if [[ "$WATCH" == "0" ]]; then
+		echo "binary=$BINARY_PATH"
+	else
+		echo "binary=$ROOT_DIR/.tmp/air/logal"
+	fi
+	echo "config=$CONFIG_PATH"
+	echo "db=$AUTOK_LOGAL_DB_PATH"
+	echo "otlp_port=$AUTOK_LOGAL_OTLP_PORT"
+	echo "health_port=$AUTOK_LOGAL_HEALTH_PORT"
+	if [[ "$WATCH" == "0" ]]; then
+		echo "runner=direct"
+	else
+		echo "runner=air"
+	fi
+	exit 0
 fi
 
-mkdir -p "$ROOT_DIR/bin" "$(dirname "$AUTOK_LOGAL_DB_PATH")"
+mkdir -p "$(dirname "$AUTOK_LOGAL_DB_PATH")"
 cd "$ROOT_DIR"
 
+if [[ "$WATCH" != "0" ]]; then
+	if ! command -v air >/dev/null 2>&1; then
+		echo "air is required; install it with:" >&2
+		echo "  go install github.com/air-verse/air@latest" >&2
+		exit 1
+	fi
+	exec air -color never -c "$ROOT_DIR/.air.toml" -- --config "$CONFIG_PATH" "$@"
+fi
+
+mkdir -p "$(dirname "$BINARY_PATH")"
 needs_build=false
 SOURCE_MANIFEST="${BINARY_PATH}.sources"
 build_inputs=()

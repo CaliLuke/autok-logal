@@ -4,56 +4,152 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 DB_PATH="$TMP_DIR/otel.debug.sqlite"
+LOG_PATH="$TMP_DIR/logal.log"
 OTLP_PORT="${AUTOK_LOGAL_TEST_OTLP_PORT:-24318}"
 HEALTH_PORT="${AUTOK_LOGAL_TEST_HEALTH_PORT:-23133}"
 PID=""
 
+fail() {
+	echo "contract test failed: $*" >&2
+	return 1
+}
+
+assert_eq() {
+	local expected="$1"
+	local actual="$2"
+	local description="$3"
+	if [[ "$actual" != "$expected" ]]; then
+		fail "$description: expected '$expected', got '$actual'"
+	fi
+}
+
+stop_process() {
+	if [[ -z "$PID" ]]; then
+		return
+	fi
+	if kill -0 "$PID" 2>/dev/null; then
+		kill -INT "$PID" 2>/dev/null || true
+		(
+			sleep 5
+			kill -KILL "$PID" 2>/dev/null || true
+		) &
+		local guard_pid=$!
+		wait "$PID" 2>/dev/null || true
+		kill "$guard_pid" 2>/dev/null || true
+		wait "$guard_pid" 2>/dev/null || true
+	else
+		wait "$PID" 2>/dev/null || true
+	fi
+	PID=""
+}
+
+assert_graceful_shutdown() {
+	local forced_marker="$TMP_DIR/forced-kill"
+	local guard_pid
+	local exit_status
+
+	kill -INT "$PID" || fail "could not signal Logal for graceful shutdown"
+	(
+		sleep 5
+		if kill -0 "$PID" 2>/dev/null; then
+			touch "$forced_marker"
+			kill -KILL "$PID" 2>/dev/null || true
+		fi
+	) &
+	guard_pid=$!
+	set +e
+	wait "$PID"
+	exit_status=$?
+	set -e
+	PID=""
+	kill "$guard_pid" 2>/dev/null || true
+	wait "$guard_pid" 2>/dev/null || true
+
+	if [[ -e "$forced_marker" ]]; then
+		fail "Logal did not stop within 5 seconds of SIGINT"
+	fi
+	assert_eq "0" "$exit_status" "graceful shutdown exit status"
+}
+
 cleanup() {
-  if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
-    kill -INT "$PID"
-    wait "$PID"
-  fi
-  rm -rf "$TMP_DIR"
+	local status=$?
+	trap - EXIT
+	stop_process
+	if [[ "$status" -ne 0 && -f "$LOG_PATH" ]]; then
+		echo "----- Logal contract-test output -----" >&2
+		sed -n '1,240p' "$LOG_PATH" >&2
+	fi
+	rm -rf "$TMP_DIR"
+	exit "$status"
 }
 trap cleanup EXIT
+
+for command in curl lsof sqlite3; do
+	command -v "$command" >/dev/null 2>&1 || fail "$command is required"
+done
+for port in "$OTLP_PORT" "$HEALTH_PORT"; do
+	pids="$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+	if [[ -n "$pids" ]]; then
+		fail "TCP port $port is already in use by PID(s): $pids"
+	fi
+done
 
 cd "$ROOT_DIR"
 go build -o "$TMP_DIR/logal" ./cmd/logal
 AUTOK_LOGAL_DB_PATH="$DB_PATH" \
-AUTOK_LOGAL_RETENTION_HOURS=48 \
-AUTOK_LOGAL_OTLP_PORT="$OTLP_PORT" \
-AUTOK_LOGAL_HEALTH_PORT="$HEALTH_PORT" \
-  "$TMP_DIR/logal" --config "$ROOT_DIR/config/local.yaml" >"$TMP_DIR/logal.log" 2>&1 &
+	AUTOK_LOGAL_RETENTION_HOURS=48 \
+	AUTOK_LOGAL_OTLP_PORT="$OTLP_PORT" \
+	AUTOK_LOGAL_HEALTH_PORT="$HEALTH_PORT" \
+	"$TMP_DIR/logal" --config "$ROOT_DIR/config/local.yaml" >"$LOG_PATH" 2>&1 &
 PID=$!
 
-for _ in {1..100}; do
-  if curl -fsS "http://127.0.0.1:$HEALTH_PORT/readyz" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 0.1
+ready=false
+deadline=$((SECONDS + 15))
+while ((SECONDS < deadline)); do
+	if ! kill -0 "$PID" 2>/dev/null; then
+		wait "$PID" 2>/dev/null || true
+		PID=""
+		fail "Logal exited before readiness"
+	fi
+	if curl --connect-timeout 1 --max-time 2 -fsS "http://127.0.0.1:$HEALTH_PORT/readyz" >/dev/null 2>&1; then
+		ready=true
+		break
+	fi
+	sleep 0.1
 done
-curl -fsS "http://127.0.0.1:$HEALTH_PORT/readyz" >/dev/null
+[[ "$ready" == true ]] || fail "Logal did not become ready within 15 seconds"
 
-curl -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/logs" \
-  -H 'Content-Type: application/json' \
-  --data '{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeLogs":[{"logRecords":[{"severityNumber":9,"severityText":"INFO","body":{"kvlistValue":{"values":[{"key":"message","value":{"stringValue":"ready"}},{"key":"password","value":{"stringValue":"must-not-persist-body"}}]}},"attributes":[{"key":"authorization","value":{"stringValue":"Bearer must-not-persist"}},{"key":"event.name","value":{"stringValue":"contract.frontend.ready"}},{"key":"request.id","value":{"stringValue":"request-123"}},{"key":"autok.product.id","value":{"stringValue":"product-456"}},{"key":"app.component","value":{"stringValue":"frontend"}}]}]}]}]}' >/dev/null
+for port in "$OTLP_PORT" "$HEALTH_PORT"; do
+	owner="$(lsof -nP -a -p "$PID" -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+	assert_eq "$PID" "$owner" "Logal ownership of TCP port $port"
+done
 
-curl -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/traces" \
-  -H 'Content-Type: application/json' \
-  --data '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeSpans":[{"spans":[{"traceId":"00112233445566778899aabbccddeeff","spanId":"0011223344556677","name":"stable"}]}]}]}' >/dev/null
+LOG_PAYLOAD='{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeLogs":[{"logRecords":[{"severityNumber":9,"severityText":"INFO","body":{"kvlistValue":{"values":[{"key":"message","value":{"stringValue":"ready"}},{"key":"password","value":{"stringValue":"must-not-persist-body"}}]}},"attributes":[{"key":"authorization","value":{"stringValue":"Bearer must-not-persist"}},{"key":"event.name","value":{"stringValue":"contract.frontend.ready"}},{"key":"request.id","value":{"stringValue":"request-123"}},{"key":"autok.product.id","value":{"stringValue":"product-456"}},{"key":"app.component","value":{"stringValue":"frontend"}}]}]}]}]}'
+for _ in 1 2; do
+	curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/logs" \
+		-H 'Content-Type: application/json' \
+		--data "$LOG_PAYLOAD" >/dev/null
+done
 
-curl -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/traces" \
-  -H 'Content-Type: application/json' \
-  --data '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeSpans":[{"spans":[{"traceId":"ffeeddccbbaa99887766554433221100","spanId":"7766554433221100","name":"other"},{"traceId":"00112233445566778899aabbccddeeff","spanId":"0011223344556677","name":"stable"}]}]}]}' >/dev/null
+curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/traces" \
+	-H 'Content-Type: application/json' \
+	--data '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeSpans":[{"spans":[{"traceId":"00112233445566778899aabbccddeeff","spanId":"0011223344556677","name":"stable"}]}]}]}' >/dev/null
 
-test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE service_name='contract'")" = "1"
-test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE payload_json LIKE '%must-not-persist%'")" = "0"
-test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE body_json LIKE '%must-not-persist%'")" = "0"
-test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE payload_json LIKE '%[REDACTED]%'")" = "1"
-test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE op='contract.frontend.ready' AND request_id='request-123' AND product_id='product-456' AND component='frontend'")" = "1"
-test "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_spans WHERE service_name='contract'")" = "2"
-test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$OTLP_PORT/v1/metrics" -H 'Content-Type: application/json' --data '{}')" = "404"
+curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/traces" \
+	-H 'Content-Type: application/json' \
+	--data '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeSpans":[{"spans":[{"traceId":"ffeeddccbbaa99887766554433221100","spanId":"7766554433221100","name":"other"},{"traceId":"00112233445566778899aabbccddeeff","spanId":"0011223344556677","name":"stable"}]}]}]}' >/dev/null
 
-kill -INT "$PID"
-wait "$PID"
-PID=""
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE service_name='contract'")" "log deduplication"
+assert_eq "0" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE payload_json LIKE '%must-not-persist%'")" "log payload redaction"
+assert_eq "0" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE body_json LIKE '%must-not-persist%'")" "log body redaction"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE payload_json LIKE '%[REDACTED]%'")" "redaction marker persistence"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE op='contract.frontend.ready' AND request_id='request-123' AND product_id='product-456' AND component='frontend'")" "correlation field extraction"
+assert_eq "2" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_spans WHERE service_name='contract'")" "span deduplication"
+
+metrics_status="$(curl --connect-timeout 1 --max-time 5 -sS -o /dev/null -w '%{http_code}' \
+	-X POST "http://127.0.0.1:$OTLP_PORT/v1/metrics" \
+	-H 'Content-Type: application/json' --data '{}')"
+assert_eq "404" "$metrics_status" "unsupported metrics response"
+
+kill -0 "$PID" 2>/dev/null || fail "Logal exited before graceful shutdown"
+assert_graceful_shutdown

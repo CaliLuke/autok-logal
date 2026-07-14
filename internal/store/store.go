@@ -793,16 +793,23 @@ func (s *Store) deletePressureBatch(ctx context.Context) error {
 func (s *Store) Snapshot(ctx context.Context) Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	snapshot := s.OperationalSnapshot()
+	if s.db != nil {
+		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_logs`).Scan(&snapshot.OldestLog)
+		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_spans`).Scan(&snapshot.OldestSpan)
+	}
+	return snapshot
+}
+
+// OperationalSnapshot returns the counters and capacity state without waiting
+// for the SQLite writer. It is intended for periodic health reporting.
+func (s *Store) OperationalSnapshot() Snapshot {
 	snapshot := Snapshot{Ready: s.ready.Load(), CommittedLogs: s.committedLogs.Load(), CommittedSpans: s.committedSpans.Load(), DeletedLogs: s.deletedLogs.Load(), DeletedSpans: s.deletedSpans.Load()}
 	snapshot.DatabaseBytes, snapshot.ActiveBytes, snapshot.FreeBytes, snapshot.WALBytes = diskState(s.cfg.Path)
 	if lastError := s.lastError.Load(); lastError != nil {
 		snapshot.LastError = *lastError
 	}
 	snapshot.Ready = snapshot.Ready && snapshot.ActiveBytes+requestReserve < activeHardLimit && snapshot.WALBytes < walNotReady && snapshot.FreeBytes >= freeDiskFloor+uint64(requestReserve)
-	if s.db != nil {
-		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_logs`).Scan(&snapshot.OldestLog)
-		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_spans`).Scan(&snapshot.OldestSpan)
-	}
 	return snapshot
 }
 

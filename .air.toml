@@ -1,0 +1,24 @@
+root = "."
+tmp_dir = ".tmp/air"
+
+[build]
+cmd = "go build -o ./.tmp/air/logal ./cmd/logal"
+entrypoint = ["./.tmp/air/logal"]
+include_ext = ["go", "mod", "sum", "yaml"]
+exclude_dir = [".git", ".tmp", "bin"]
+exclude_regex = ["_test\\.go"]
+delay = 300
+stop_on_error = false
+send_interrupt = true
+kill_delay = "2s"
+
+[log]
+time = true
+
+[misc]
+clean_on_exit = true
+startup_banner = ""
+
+[screen]
+clear_on_rebuild = false
+keep_scroll = true
