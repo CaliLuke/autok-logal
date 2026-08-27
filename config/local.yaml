@@ -1,16 +1,19 @@
 extensions:
   logal_store:
-    path: ${env:AUTOK_LOGAL_DB_PATH}
-    retention_hours: ${env:AUTOK_LOGAL_RETENTION_HOURS}
+    path: ${env:LOGAL_DB_PATH}
+    retention_hours: ${env:LOGAL_RETENTION_HOURS}
   logal_status:
-    endpoint: 127.0.0.1:${env:AUTOK_LOGAL_HEALTH_PORT}
-    max_in_flight_requests: 8
+    endpoint: ${env:LOGAL_HEALTH_ENDPOINT}
+    max_in_flight_requests: ${env:LOGAL_MAX_IN_FLIGHT_REQUESTS}
 
 receivers:
   otlp:
     protocols:
+      grpc:
+        endpoint: ${env:LOGAL_OTLP_GRPC_ENDPOINT}
+        max_recv_msg_size_mib: 4
       http:
-        endpoint: 127.0.0.1:${env:AUTOK_LOGAL_OTLP_PORT}
+        endpoint: ${env:LOGAL_OTLP_HTTP_ENDPOINT}
         max_request_body_size: 4194304
         middlewares:
           - id: logal_status

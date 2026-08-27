@@ -5,8 +5,9 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 DB_PATH="$TMP_DIR/otel.debug.sqlite"
 LOG_PATH="$TMP_DIR/logal.log"
-OTLP_PORT="${AUTOK_LOGAL_TEST_OTLP_PORT:-24318}"
-HEALTH_PORT="${AUTOK_LOGAL_TEST_HEALTH_PORT:-23133}"
+OTLP_GRPC_PORT="${LOGAL_TEST_OTLP_GRPC_PORT:-24317}"
+OTLP_HTTP_PORT="${LOGAL_TEST_OTLP_HTTP_PORT:-${AUTOK_LOGAL_TEST_OTLP_PORT:-24318}}"
+HEALTH_PORT="${LOGAL_TEST_HEALTH_PORT:-${AUTOK_LOGAL_TEST_HEALTH_PORT:-23133}}"
 PID=""
 
 fail() {
@@ -87,7 +88,7 @@ trap cleanup EXIT
 for command in curl lsof sqlite3; do
 	command -v "$command" >/dev/null 2>&1 || fail "$command is required"
 done
-for port in "$OTLP_PORT" "$HEALTH_PORT"; do
+for port in "$OTLP_GRPC_PORT" "$OTLP_HTTP_PORT" "$HEALTH_PORT"; do
 	pids="$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
 	if [[ -n "$pids" ]]; then
 		fail "TCP port $port is already in use by PID(s): $pids"
@@ -96,10 +97,12 @@ done
 
 cd "$ROOT_DIR"
 go build -o "$TMP_DIR/logal" ./cmd/logal
-AUTOK_LOGAL_DB_PATH="$DB_PATH" \
-	AUTOK_LOGAL_RETENTION_HOURS=48 \
-	AUTOK_LOGAL_OTLP_PORT="$OTLP_PORT" \
-	AUTOK_LOGAL_HEALTH_PORT="$HEALTH_PORT" \
+LOGAL_DB_PATH="$DB_PATH" \
+	LOGAL_RETENTION_HOURS=48 \
+	LOGAL_OTLP_GRPC_ENDPOINT="127.0.0.1:$OTLP_GRPC_PORT" \
+	LOGAL_OTLP_HTTP_ENDPOINT="127.0.0.1:$OTLP_HTTP_PORT" \
+	LOGAL_HEALTH_ENDPOINT="127.0.0.1:$HEALTH_PORT" \
+	LOGAL_MAX_IN_FLIGHT_REQUESTS=8 \
 	"$TMP_DIR/logal" --config "$ROOT_DIR/config/local.yaml" >"$LOG_PATH" 2>&1 &
 PID=$!
 
@@ -119,23 +122,23 @@ while ((SECONDS < deadline)); do
 done
 [[ "$ready" == true ]] || fail "Logal did not become ready within 15 seconds"
 
-for port in "$OTLP_PORT" "$HEALTH_PORT"; do
+for port in "$OTLP_GRPC_PORT" "$OTLP_HTTP_PORT" "$HEALTH_PORT"; do
 	owner="$(lsof -nP -a -p "$PID" -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
 	assert_eq "$PID" "$owner" "Logal ownership of TCP port $port"
 done
 
 LOG_PAYLOAD='{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeLogs":[{"logRecords":[{"severityNumber":9,"severityText":"INFO","body":{"kvlistValue":{"values":[{"key":"message","value":{"stringValue":"ready"}},{"key":"password","value":{"stringValue":"must-not-persist-body"}}]}},"attributes":[{"key":"authorization","value":{"stringValue":"Bearer must-not-persist"}},{"key":"event.name","value":{"stringValue":"contract.frontend.ready"}},{"key":"request.id","value":{"stringValue":"request-123"}},{"key":"autok.product.id","value":{"stringValue":"product-456"}},{"key":"app.component","value":{"stringValue":"frontend"}}]}]}]}]}'
 for _ in 1 2; do
-	curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/logs" \
+	curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_HTTP_PORT/v1/logs" \
 		-H 'Content-Type: application/json' \
 		--data "$LOG_PAYLOAD" >/dev/null
 done
 
-curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/traces" \
+curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_HTTP_PORT/v1/traces" \
 	-H 'Content-Type: application/json' \
 	--data '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeSpans":[{"spans":[{"traceId":"00112233445566778899aabbccddeeff","spanId":"0011223344556677","name":"stable"}]}]}]}' >/dev/null
 
-curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/traces" \
+curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_HTTP_PORT/v1/traces" \
 	-H 'Content-Type: application/json' \
 	--data '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeSpans":[{"spans":[{"traceId":"ffeeddccbbaa99887766554433221100","spanId":"7766554433221100","name":"other"},{"traceId":"00112233445566778899aabbccddeeff","spanId":"0011223344556677","name":"stable"}]}]}]}' >/dev/null
 read -r -d '' METRICS_BASE <<'JSON' || true
@@ -279,11 +282,20 @@ read -r -d '' METRICS_OVERLAP <<'JSON' || true
 JSON
 
 for payload in "$METRICS_BASE" "$METRICS_BASE" "$METRICS_OVERLAP"; do
-  curl -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/metrics" \
+  curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_HTTP_PORT/v1/metrics" \
     -H 'Content-Type: application/json' \
     --data "$payload" >/dev/null
 done
 
+curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_HTTP_PORT/v1/metrics" \
+	-H 'Content-Type: application/json' \
+	--data '{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract-cross"}}]},"scopeMetrics":[{"metrics":[{"name":"contract.cross.gauge","gauge":{"dataPoints":[{"timeUnixNano":"0","asInt":"1"}]}}]}]}]}' >/dev/null
+go run ./internal/contractgrpc -endpoint "127.0.0.1:$OTLP_GRPC_PORT"
+
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE service_name='grpc-contract'")" "gRPC log ingestion"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_spans WHERE service_name='grpc-contract'")" "gRPC trace ingestion"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE service_name='grpc-contract' AND metric_name='grpc.contract.gauge'")" "gRPC metric ingestion"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE service_name='contract-cross' AND metric_name='contract.cross.gauge'")" "cross-protocol metric deduplication"
 assert_eq "6" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE service_name='contract'")" "metric deduplication"
 assert_eq "5" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(DISTINCT metric_type) FROM otel_metric_points WHERE service_name='contract'")" "metric type coverage"
 assert_eq "2" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.gauge' AND metric_type='gauge' AND number_kind='int' AND number_int IN (1,2) AND time_unix_nano=0")" "same-time metric preservation"
@@ -300,7 +312,7 @@ assert_eq "6" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_
 assert_eq "0" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE payload_json LIKE '%metric-resource-secret%' OR payload_json LIKE '%metric-scope-secret%' OR payload_json LIKE '%metric-point-secret%' OR payload_json LIKE '%metric-exemplar-secret%'")" "metric credential redaction"
 assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.gauge' AND payload_json LIKE '%gen_ai.usage.input_tokens%' AND payload_json LIKE '%123%'")" "token count preservation"
 STATUS_JSON="$(curl --connect-timeout 1 --max-time 5 -fsS "http://127.0.0.1:$HEALTH_PORT/status")"
-[[ "$STATUS_JSON" == *'"committed_metric_points":6'* ]] || fail "status metric counter"
+[[ "$STATUS_JSON" == *'"committed_metric_points":8'* ]] || fail "status metric counter"
 
 assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE service_name='contract'")" "log deduplication"
 assert_eq "0" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE payload_json LIKE '%must-not-persist%'")" "log payload redaction"

@@ -16,11 +16,13 @@ absolute_path() {
 BINARY_PATH="$(absolute_path "${AUTOK_LOGAL_BINARY_PATH:-$ROOT_DIR/bin/logal}")"
 CONFIG_PATH="$(absolute_path "${AUTOK_LOGAL_CONFIG_PATH:-$ROOT_DIR/config/local.yaml}")"
 
-AUTOK_LOGAL_DB_PATH="$(absolute_path "${AUTOK_LOGAL_DB_PATH:-$AUTOK_ROOT/otel.debug.sqlite}")"
-export AUTOK_LOGAL_DB_PATH
-export AUTOK_LOGAL_RETENTION_HOURS="${AUTOK_LOGAL_RETENTION_HOURS:-48}"
-export AUTOK_LOGAL_OTLP_PORT="${AUTOK_LOGAL_OTLP_PORT:-4318}"
-export AUTOK_LOGAL_HEALTH_PORT="${AUTOK_LOGAL_HEALTH_PORT:-13133}"
+LOGAL_DB_PATH="$(absolute_path "${LOGAL_DB_PATH:-${AUTOK_LOGAL_DB_PATH:-$AUTOK_ROOT/otel.debug.sqlite}}")"
+export LOGAL_DB_PATH
+export LOGAL_RETENTION_HOURS="${LOGAL_RETENTION_HOURS:-${AUTOK_LOGAL_RETENTION_HOURS:-48}}"
+export LOGAL_OTLP_GRPC_ENDPOINT="${LOGAL_OTLP_GRPC_ENDPOINT:-127.0.0.1:${LOGAL_OTLP_GRPC_PORT:-4317}}"
+export LOGAL_OTLP_HTTP_ENDPOINT="${LOGAL_OTLP_HTTP_ENDPOINT:-127.0.0.1:${LOGAL_OTLP_HTTP_PORT:-${AUTOK_LOGAL_OTLP_PORT:-4318}}}"
+export LOGAL_HEALTH_ENDPOINT="${LOGAL_HEALTH_ENDPOINT:-127.0.0.1:${LOGAL_HEALTH_PORT:-${AUTOK_LOGAL_HEALTH_PORT:-13133}}}"
+export LOGAL_MAX_IN_FLIGHT_REQUESTS="${LOGAL_MAX_IN_FLIGHT_REQUESTS:-8}"
 WATCH="${AUTOK_LOGAL_WATCH:-1}"
 
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -35,9 +37,11 @@ if [[ "${1:-}" == "--dry-run" ]]; then
 		echo "binary=$ROOT_DIR/.tmp/air/logal"
 	fi
 	echo "config=$CONFIG_PATH"
-	echo "db=$AUTOK_LOGAL_DB_PATH"
-	echo "otlp_port=$AUTOK_LOGAL_OTLP_PORT"
-	echo "health_port=$AUTOK_LOGAL_HEALTH_PORT"
+	echo "db=$LOGAL_DB_PATH"
+	echo "otlp_grpc_endpoint=$LOGAL_OTLP_GRPC_ENDPOINT"
+	echo "otlp_http_endpoint=$LOGAL_OTLP_HTTP_ENDPOINT"
+	echo "health_endpoint=$LOGAL_HEALTH_ENDPOINT"
+	echo "max_in_flight_requests=$LOGAL_MAX_IN_FLIGHT_REQUESTS"
 	if [[ "$WATCH" == "0" ]]; then
 		echo "runner=direct"
 	else
@@ -46,7 +50,7 @@ if [[ "${1:-}" == "--dry-run" ]]; then
 	exit 0
 fi
 
-mkdir -p "$(dirname "$AUTOK_LOGAL_DB_PATH")"
+mkdir -p "$(dirname "$LOGAL_DB_PATH")"
 cd "$ROOT_DIR"
 
 if [[ "$WATCH" != "0" ]]; then

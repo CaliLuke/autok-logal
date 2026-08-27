@@ -13,9 +13,10 @@ absolute_path() {
 	fi
 }
 
-DB_PATH="$(absolute_path "${AUTOK_LOGAL_DB_PATH:-$AUTOK_ROOT/otel.debug.sqlite}")"
-OTLP_PORT="${AUTOK_LOGAL_OTLP_PORT:-4318}"
-HEALTH_PORT="${AUTOK_LOGAL_HEALTH_PORT:-13133}"
+DB_PATH="$(absolute_path "${LOGAL_DB_PATH:-${AUTOK_LOGAL_DB_PATH:-$AUTOK_ROOT/otel.debug.sqlite}}")"
+OTLP_GRPC_ENDPOINT="${LOGAL_OTLP_GRPC_ENDPOINT:-127.0.0.1:${LOGAL_OTLP_GRPC_PORT:-4317}}"
+OTLP_HTTP_ENDPOINT="${LOGAL_OTLP_HTTP_ENDPOINT:-127.0.0.1:${LOGAL_OTLP_HTTP_PORT:-${AUTOK_LOGAL_OTLP_PORT:-4318}}}"
+HEALTH_ENDPOINT="${LOGAL_HEALTH_ENDPOINT:-127.0.0.1:${LOGAL_HEALTH_PORT:-${AUTOK_LOGAL_HEALTH_PORT:-13133}}}"
 
 if [[ "${1:-}" != "" && "${1:-}" != "--confirm" ]] || [[ $# -gt 1 ]]; then
 	echo "usage: $0 [--confirm]" >&2
@@ -34,10 +35,11 @@ for candidate in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm" "$DB_PATH.lock"; do
 		busy=true
 	fi
 done
-for port in "$OTLP_PORT" "$HEALTH_PORT"; do
+for endpoint in "$OTLP_GRPC_ENDPOINT" "$OTLP_HTTP_ENDPOINT" "$HEALTH_ENDPOINT"; do
+	port="${endpoint##*:}"
 	pids="$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
 	if [[ -n "$pids" ]]; then
-		echo "refusing reset: TCP port $port is listening under PID(s): $pids" >&2
+		echo "refusing reset: $endpoint is listening under PID(s): $pids" >&2
 		busy=true
 	fi
 done

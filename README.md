@@ -1,7 +1,7 @@
 # autok-logal
 
 Logal is Auto-K's local OpenTelemetry collector for logs, traces, and metrics.
-It accepts OTLP/HTTP telemetry from local applications and persists a recent,
+It accepts OTLP/gRPC and OTLP/HTTP telemetry from local applications and persists a recent,
 queryable window in `../otel.debug.sqlite`.
 
 This is disposable development infrastructure, not a production observability
@@ -47,9 +47,9 @@ autok-deploy/
 ```text
 frontend / admin / auth / server
         │
-        │ OTLP/HTTP logs, traces, and metrics
+        │ OTLP/gRPC :4317 or OTLP/HTTP :4318
         ▼
-  127.0.0.1:4318
+Official OpenTelemetry OTLP receiver
         │
         ▼
 OpenTelemetry HTTP receiver
@@ -95,7 +95,7 @@ Keep these constraints intact when changing Logal:
 - Logs, traces, and metrics share one database, retention policy, and pressure
   policy.
 - The collector binds to loopback and is intended only for local development.
-- Apps communicate over OTLP/HTTP and must not share Logal's SQLite writer.
+- Apps communicate over standard OTLP/gRPC or OTLP/HTTP and must not share Logal's SQLite writer.
 - Queries must be read-only and short-lived.
 - Do not add a query API, dashboards, production deployment machinery, or
   long-term persistence here.
@@ -135,9 +135,9 @@ cd autok-logal
 ./scripts/run --dry-run
 ```
 
-The output should show `runner=air`, the two ports, the collector config, and
-the database path. If the `stack` command itself is not installed, build it
-from the monorepo root:
+The output should show `runner=air`, all three listener endpoints, the
+collector config, and the database path. If `stack` itself is not installed,
+build it from the monorepo root:
 
 ```bash
 ./autok-stack/scripts/install
@@ -148,7 +148,7 @@ from the monorepo root:
 The parent [`stack.toml`](../stack.toml) declares Logal with:
 
 - command `./autok-logal/scripts/run`;
-- ports `4318` and `13133`;
+- ports `4317`, `4318`, and `13133`;
 - readiness `/readyz` and liveness `/livez`;
 - a 30-second initial readiness timeout;
 - automatic restart if the service process exits unexpectedly.
@@ -180,17 +180,24 @@ corruption.
 ## Configuration
 
 [`config/local.yaml`](config/local.yaml) is the collector topology. Environment
-variables provide machine-specific paths and ports:
+variables provide machine-specific paths, full bind endpoints, and limits:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AUTOK_LOGAL_DB_PATH` | `<monorepo>/otel.debug.sqlite` | Destructive/disposable SQLite target; never point it at valuable data. |
-| `AUTOK_LOGAL_RETENTION_HOURS` | `48` | Age cutoff for logs and spans; must be positive. |
-| `AUTOK_LOGAL_OTLP_PORT` | `4318` | Loopback OTLP/HTTP receiver port. |
-| `AUTOK_LOGAL_HEALTH_PORT` | `13133` | Loopback health and status port. |
-| `AUTOK_LOGAL_CONFIG_PATH` | `autok-logal/config/local.yaml` | Collector configuration file. |
+| `LOGAL_DB_PATH` | `<monorepo>/otel.debug.sqlite` | Destructive/disposable SQLite target; never point it at valuable data. |
+| `LOGAL_RETENTION_HOURS` | `48` | Receipt-time cutoff for every signal; must be positive. |
+| `LOGAL_OTLP_GRPC_ENDPOINT` | `127.0.0.1:4317` | Full OTLP/gRPC bind endpoint. |
+| `LOGAL_OTLP_HTTP_ENDPOINT` | `127.0.0.1:4318` | Full OTLP/HTTP bind endpoint. |
+| `LOGAL_HEALTH_ENDPOINT` | `127.0.0.1:13133` | Full health/status bind endpoint. |
+| `LOGAL_MAX_IN_FLIGHT_REQUESTS` | `8` | HTTP admission limit shared by all HTTP signal paths. |
+| `AUTOK_LOGAL_CONFIG_PATH` | `autok-logal/config/local.yaml` | Auto-K runner configuration file. |
 | `AUTOK_LOGAL_WATCH` | `1` | Set to `0` to bypass Air. |
 | `AUTOK_LOGAL_BINARY_PATH` | `autok-logal/bin/logal` | Direct-mode binary path; ignored by Air mode. |
+
+Port-only conveniences `LOGAL_OTLP_GRPC_PORT`, `LOGAL_OTLP_HTTP_PORT`, and
+`LOGAL_HEALTH_PORT` construct loopback defaults when the corresponding full
+endpoint is not set. Full endpoints take precedence and allow alternate
+loopback addresses, IPv6, containers, and isolated project profiles.
 
 Relative path overrides are resolved from the directory where `scripts/run` is
 invoked and converted to absolute paths before the runner changes directory.
@@ -198,26 +205,27 @@ invoked and converted to absolute paths before the runner changes directory.
 Example isolated instance:
 
 ```bash
-AUTOK_LOGAL_DB_PATH=/tmp/logal/otel.debug.sqlite \
-AUTOK_LOGAL_OTLP_PORT=34318 \
-AUTOK_LOGAL_HEALTH_PORT=33133 \
+LOGAL_DB_PATH=/tmp/logal/otel.debug.sqlite \
+LOGAL_OTLP_GRPC_ENDPOINT=127.0.0.1:34317 \
+LOGAL_OTLP_HTTP_ENDPOINT=127.0.0.1:34318 \
+LOGAL_HEALTH_ENDPOINT=127.0.0.1:33133 \
 ./scripts/run
 ```
 
 Stop this standalone Air session with `Ctrl+C`. The example deliberately avoids
 both the normal stack ports and the contract test's default ports.
 
-The default receiver accepts:
+The default receiver accepts OTLP/gRPC on `127.0.0.1:4317` and OTLP/HTTP on:
 
 - `POST http://127.0.0.1:4318/v1/logs`
 - `POST http://127.0.0.1:4318/v1/traces`
+- `POST http://127.0.0.1:4318/v1/metrics`
 
-The HTTP request body limit is 4 MiB. The exporter additionally rejects log
-batches above 10,000 records, trace batches above 5,000 spans, more than 64 MiB
-of cumulative normalized payload, body/attribute string or byte values above 1
-MiB, and body/attribute values nested beyond 16 levels. The 1 MiB value limit
-does not apply to every OTLP text field, such as span names or severity text.
-These are request failures; partial batches are not committed.
+Both protocols feed the same official Collector receiver, exporters, store,
+transactions, retention, and deduplication path. The HTTP and gRPC receive
+limits are 4 MiB. Exporters additionally enforce signal count, normalized
+payload, scalar-size, and nesting limits; request failures never partially
+commit a batch.
 
 Direct browser CORS allows `localhost` and `127.0.0.1` on port `3000`, but only
 `localhost` on port `5173`. The Vite applications normally use their
@@ -420,12 +428,13 @@ go build -o /tmp/autok-logal ./cmd/logal
 ./scripts/contract-test
 ```
 
-The contract test uses a temporary database and the fixed non-stack ports
-`24318`/`23133`. Stop any process using those ports first, or override them:
+The contract test uses a temporary database and fixed non-stack ports
+`24317`/`24318`/`23133`. Override any listener independently:
 
 ```bash
-AUTOK_LOGAL_TEST_OTLP_PORT=25318 \
-AUTOK_LOGAL_TEST_HEALTH_PORT=25133 \
+LOGAL_TEST_OTLP_GRPC_PORT=25317 \
+LOGAL_TEST_OTLP_HTTP_PORT=25318 \
+LOGAL_TEST_HEALTH_PORT=25133 \
 ./scripts/contract-test
 ```
 
@@ -433,6 +442,8 @@ The contract verifies:
 
 - readiness;
 - log, trace, and all five metric-type ingestion;
+- OTLP/gRPC ingestion for all three signals;
+- cross-protocol content deduplication;
 - recursive sensitive-field redaction;
 - extracted correlation and metric projection columns;
 - log, span, and metric deduplication behavior;
@@ -455,13 +466,13 @@ process is alive.
 ```bash
 lsof ../otel.debug.sqlite ../otel.debug.sqlite-wal ../otel.debug.sqlite-shm \
   ../otel.debug.sqlite.lock
-lsof -nP -iTCP:4318 -iTCP:13133 -sTCP:LISTEN
+lsof -nP -iTCP:4317 -iTCP:4318 -iTCP:13133 -sTCP:LISTEN
 ```
 
 Stop the duplicate Logal or close the read-only SQLite shell, then restart the
 service.
 
-### Port 4318 or 13133 is already in use
+### Port 4317, 4318, or 13133 is already in use
 
 Use the `lsof` command above. Usually a standalone Logal was left running while
 the stack tried to start another one. Stop the extra process; do not point two
@@ -477,12 +488,12 @@ saturation intentionally makes the service not-ready.
 ### Apps run but no rows appear
 
 1. Check `/readyz` and `/status`.
-2. Confirm the producer uses the signal-matching `/v1/logs`, `/v1/traces`, or `/v1/metrics` endpoint.
-3. Confirm its endpoint resolves to `127.0.0.1:4318` or the Vite proxy.
-4. Look for `requests_rejected` or collector validation errors in the Logal
+2. Confirm the producer uses OTLP/gRPC on `127.0.0.1:4317` or the
+   signal-matching OTLP/HTTP endpoint on `127.0.0.1:4318`.
+3. Look for `requests_rejected` or collector validation errors in the Logal
    pane. A zero rejection counter does not rule out parsing, validation, or
    store errors because that counter covers only middleware refusal.
-5. Query by `service_name`; missing resource names are stored as
+4. Query by `service_name`; missing resource names are stored as
    `unknown_service`.
 
 ### Air reports a build failure
@@ -509,11 +520,12 @@ its configured ports are active:
 ./scripts/reset-db --confirm
 ```
 
-The helper honors `AUTOK_LOGAL_DB_PATH`, `AUTOK_LOGAL_OTLP_PORT`, and
-`AUTOK_LOGAL_HEALTH_PORT`; pass the same overrides used to start Logal. It
-aborts if any database/lock file is open or either port is listening, and the
-destructive action requires `--confirm`. Then restart Logal. Never run this
-against a path whose ownership or contents matter.
+The helper honors `LOGAL_DB_PATH` and all three configurable listener
+endpoints; pass the same overrides used to start Logal. It aborts if any
+database/lock file is open or any configured TCP port is listening. The
+destructive action requires `--confirm`. Never use it against a path whose
+ownership or contents matter.
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
