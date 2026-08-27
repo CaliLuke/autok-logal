@@ -29,6 +29,8 @@ exporters:
     store: logal_store
   logal_sqlite/traces:
     store: logal_store
+  logal_sqlite/metrics:
+    store: logal_store
 
 service:
   telemetry:
@@ -42,3 +44,6 @@ service:
     traces:
       receivers: [otlp]
       exporters: [logal_sqlite/traces]
+    metrics:
+      receivers: [otlp]
+      exporters: [logal_sqlite/metrics]

@@ -1,14 +1,14 @@
 # autok-logal
 
-Logal is Auto-K's local OpenTelemetry logs-and-traces collector. It accepts
-OTLP/HTTP telemetry from the local applications and persists a recent,
+Logal is Auto-K's local OpenTelemetry collector for logs, traces, and metrics.
+It accepts OTLP/HTTP telemetry from local applications and persists a recent,
 queryable window in `../otel.debug.sqlite`.
 
 This is disposable development infrastructure, not a production observability
 platform. The most important rule is:
 
 > Logal is the only process allowed to open `otel.debug.sqlite` read-write.
-> Applications export OTLP logs and traces; they never write the database.
+> Applications export OTLP logs, traces, and metrics; they never write the database.
 
 ## Agent quick start
 
@@ -47,7 +47,7 @@ autok-deploy/
 ```text
 frontend / admin / auth / server
         │
-        │ OTLP/HTTP logs and traces
+        │ OTLP/HTTP logs, traces, and metrics
         ▼
   127.0.0.1:4318
         │
@@ -74,12 +74,12 @@ are:
 | Path | Responsibility |
 | --- | --- |
 | `cmd/logal/main.go` | Registers only the OTLP receiver, Logal exporters, store, and status extension. |
-| `config/local.yaml` | Wires the logs and traces pipelines and binds their local endpoints. |
-| `internal/exporter` | Validates OTLP values, redacts sensitive fields, extracts query columns, and creates one SQLite record per log/span. |
+| `config/local.yaml` | Wires the logs, traces, and metrics pipelines and binds their local endpoints. |
+| `internal/exporter` | Validates OTLP values, redacts sensitive fields, extracts query columns, and creates one SQLite record per log, span, or metric point. |
 | `internal/store` | Owns SQLite, verifies schema ownership, serializes writes, deduplicates records, enforces capacity, and performs retention. |
 | `internal/status` | Exposes health/status endpoints, limits concurrent requests, counts rejections, and emits operational summaries. |
 | `scripts/run` | Applies defaults and launches Air, or runs a direct one-shot binary when watching is disabled. |
-| `scripts/contract-test` | Starts a temporary Logal and verifies ingestion, redaction, deduplication, and the metrics boundary. |
+| `scripts/contract-test` | Starts a temporary Logal and verifies three-signal ingestion, fidelity, redaction, and deduplication. |
 | `scripts/reset-db` | Refuses active files/ports and requires explicit confirmation before deleting the disposable database. |
 
 ## Scope and invariants
@@ -92,13 +92,23 @@ Keep these constraints intact when changing Logal:
 - Logal attempts to recognize and refuse foreign SQLite databases, but that
   check is defense in depth rather than permission to use an untrusted path.
 - Symlinked, non-regular, or already-open database files are refused.
-- Logs and traces are supported. Metrics are intentionally unsupported and
-  `/v1/metrics` returns `404`.
+- Logs, traces, and metrics share one database, retention policy, and pressure
+  policy.
 - The collector binds to loopback and is intended only for local development.
 - Apps communicate over OTLP/HTTP and must not share Logal's SQLite writer.
 - Queries must be read-only and short-lived.
 - Do not add a query API, dashboards, production deployment machinery, or
   long-term persistence here.
+
+## Install
+
+```bash
+brew install CaliLuke/logal/logal
+```
+
+The Homebrew package installs one `logal` executable. Each project starts its
+own process with a project-owned collector configuration, ports, and SQLite
+database.
 
 ## First-time setup
 
@@ -326,12 +336,12 @@ At info level Logal emits:
   counters or readiness change;
 - an idle heartbeat once a minute.
 
-The activity line includes committed/deleted logs and spans,
+The activity line includes committed/deleted logs, spans, and metric points,
 middleware-rejected requests, in-flight work, readiness, database/WAL bytes,
 and free disk. Middleware rejections, not-ready state, and store errors are
 warnings. Individual incoming records are never echoed to the console. The
-collector's `Internal metrics telemetry disabled` startup message is expected
-because Logal intentionally disables its own metrics pipeline.
+collector's `Internal metrics telemetry disabled` startup message refers to
+Logal's own self-telemetry; the OTLP application metrics pipeline remains enabled.
 
 ## Querying telemetry
 
@@ -367,20 +377,20 @@ sqlite3 -readonly -column -header ../otel.debug.sqlite \
 ```
 
 Use `payload_json` when the indexed columns do not contain the field you need.
-Use `.schema otel_logs` and `.schema otel_spans` instead of assuming an older
-column layout from another repository's documentation.
+Inspect `.schema otel_logs`, `.schema otel_spans`, and
+`.schema otel_metric_points` instead of assuming another schema version.
 
 ## Adding or checking a telemetry producer
 
 A local producer should:
 
-1. Export OTLP/HTTP logs to `/v1/logs` and traces to `/v1/traces` on port 4318.
+1. Export OTLP/HTTP logs, traces, and metrics to `/v1/logs`, `/v1/traces`, and `/v1/metrics`.
 2. Set resource `service.name` to a stable application name.
 3. Populate `request.id`, `autok.product.id`, `app.component`, and `event.name`
    when those correlation fields exist.
 4. Treat `503` as temporary not-ready/saturation and retry with bounded
    backoff. Treat malformed or oversized payload responses as producer bugs.
-5. Avoid metrics and never open the SQLite database read-write.
+5. Never open the SQLite database read-write.
 
 Verify the producer in three places:
 
@@ -389,6 +399,11 @@ curl -fsS http://127.0.0.1:13133/readyz
 curl -sS http://127.0.0.1:13133/status | jq '.store, .rejected_requests'
 sqlite3 -readonly ../otel.debug.sqlite \
   "SELECT service_name, COUNT(*) FROM otel_logs GROUP BY service_name"
+
+sqlite3 -readonly ../otel.debug.sqlite \
+  "SELECT service_name, metric_name, metric_type, number_int, number_double,
+          aggregate_count, aggregate_sum
+   FROM otel_metric_points ORDER BY id DESC LIMIT 20"
 ```
 
 Allow up to 10 seconds for the aggregated activity line; committed rows should
@@ -417,11 +432,11 @@ AUTOK_LOGAL_TEST_HEALTH_PORT=25133 \
 The contract verifies:
 
 - readiness;
-- log and trace ingestion;
+- log, trace, and all five metric-type ingestion;
 - recursive sensitive-field redaction;
-- extracted correlation columns;
-- log/span deduplication behavior;
-- the intentional `/v1/metrics` `404`;
+- extracted correlation and metric projection columns;
+- log, span, and metric deduplication behavior;
+- full metric payload fidelity;
 - graceful `SIGINT` shutdown.
 
 Air excludes `*_test.go` from reload triggers, so changing only tests does not
@@ -462,7 +477,7 @@ saturation intentionally makes the service not-ready.
 ### Apps run but no rows appear
 
 1. Check `/readyz` and `/status`.
-2. Confirm the producer uses `/v1/logs` or `/v1/traces`, not `/v1/metrics`.
+2. Confirm the producer uses the signal-matching `/v1/logs`, `/v1/traces`, or `/v1/metrics` endpoint.
 3. Confirm its endpoint resolves to `127.0.0.1:4318` or the Vite proxy.
 4. Look for `requests_rejected` or collector validation errors in the Logal
    pane. A zero rejection counter does not rule out parsing, validation, or
@@ -477,10 +492,10 @@ will retry after the next relevant change. Restart the service manually after
 editing `.air.toml` or `scripts/run` itself: select Logal in the stack and press
 `r`, or stop a standalone Air session with `Ctrl+C` and rerun `./scripts/run`.
 
-### Metrics return 404
+### Metrics are not appearing
 
-This is expected. Logal stores only logs and traces. Do not add an empty metrics
-pipeline as a workaround.
+Confirm `config/local.yaml` enables the metrics pipeline, the producer posts
+OTLP/HTTP to `/v1/metrics`, and `/status` reports committed metric points.
 
 ### The disposable database needs a manual reset
 
@@ -499,3 +514,6 @@ The helper honors `AUTOK_LOGAL_DB_PATH`, `AUTOK_LOGAL_OTLP_PORT`, and
 aborts if any database/lock file is open or either port is listening, and the
 destructive action requires `--confirm`. Then restart Logal. Never run this
 against a path whose ownership or contents matter.
+## License
+
+MIT. See [`LICENSE`](LICENSE).

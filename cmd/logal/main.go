@@ -19,9 +19,11 @@ import (
 	"go.opentelemetry.io/collector/service/telemetry/otelconftelemetry"
 )
 
+var version = "dev"
+
 func main() {
 	settings := otelcol.CollectorSettings{
-		BuildInfo: component.BuildInfo{Command: "logal", Description: "Auto-K local telemetry collector", Version: "2"},
+		BuildInfo: component.BuildInfo{Command: "logal", Description: "Local OpenTelemetry collector", Version: version},
 		Factories: func() (otelcol.Factories, error) {
 			return otelcol.Factories{
 				Receivers:  map[component.Type]receiver.Factory{otlpreceiver.NewFactory().Type(): otlpreceiver.NewFactory()},

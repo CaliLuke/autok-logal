@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +26,7 @@ import (
 
 const (
 	applicationID   = 0x4c4f474c
-	schemaVersion   = 4
+	schemaVersion   = 5
 	mainHighWater   = int64(2 << 30)
 	activeHardLimit = int64(3 << 30)
 	requestReserve  = int64(64 << 20)
@@ -72,36 +73,59 @@ type SpanRecord struct {
 	PayloadJSON  string
 }
 
+type MetricPointRecord struct {
+	Fingerprint    [32]byte
+	ReceivedAt     int64
+	ServiceName    string
+	MetricName     string
+	MetricType     string
+	StartTime      int64
+	Time           int64
+	NumberKind     string
+	NumberInt      *int64
+	NumberDouble   *float64
+	AggregateCount string
+	AggregateSum   *float64
+	AggregateMin   *float64
+	AggregateMax   *float64
+	PayloadJSON    string
+}
+
 type Snapshot struct {
-	Ready          bool   `json:"ready"`
-	DatabaseBytes  int64  `json:"database_bytes"`
-	WALBytes       int64  `json:"wal_bytes"`
-	OldestLog      int64  `json:"oldest_log_received_unix_nano"`
-	OldestSpan     int64  `json:"oldest_span_received_unix_nano"`
-	CommittedLogs  uint64 `json:"committed_logs"`
-	CommittedSpans uint64 `json:"committed_spans"`
-	DeletedLogs    uint64 `json:"deleted_logs"`
-	DeletedSpans   uint64 `json:"deleted_spans"`
-	ActiveBytes    int64  `json:"active_bytes"`
-	FreeBytes      uint64 `json:"free_bytes"`
-	LastError      string `json:"last_error,omitempty"`
+	Ready            bool   `json:"ready"`
+	DatabaseBytes    int64  `json:"database_bytes"`
+	WALBytes         int64  `json:"wal_bytes"`
+	OldestLog        int64  `json:"oldest_log_received_unix_nano"`
+	OldestSpan       int64  `json:"oldest_span_received_unix_nano"`
+	OldestMetric     int64  `json:"oldest_metric_received_unix_nano"`
+	CommittedLogs    uint64 `json:"committed_logs"`
+	CommittedSpans   uint64 `json:"committed_spans"`
+	CommittedMetrics uint64 `json:"committed_metric_points"`
+	DeletedLogs      uint64 `json:"deleted_logs"`
+	DeletedSpans     uint64 `json:"deleted_spans"`
+	DeletedMetrics   uint64 `json:"deleted_metric_points"`
+	ActiveBytes      int64  `json:"active_bytes"`
+	FreeBytes        uint64 `json:"free_bytes"`
+	LastError        string `json:"last_error,omitempty"`
 }
 
 type Store struct {
-	cfg            Config
-	db             *sql.DB
-	mu             sync.Mutex
-	stop           chan struct{}
-	done           chan struct{}
-	lockFile       *os.File
-	shutdownOnce   sync.Once
-	maintenanceRun atomic.Bool
-	ready          atomic.Bool
-	lastError      atomic.Pointer[string]
-	committedLogs  atomic.Uint64
-	committedSpans atomic.Uint64
-	deletedLogs    atomic.Uint64
-	deletedSpans   atomic.Uint64
+	cfg              Config
+	db               *sql.DB
+	mu               sync.Mutex
+	stop             chan struct{}
+	done             chan struct{}
+	lockFile         *os.File
+	shutdownOnce     sync.Once
+	maintenanceRun   atomic.Bool
+	ready            atomic.Bool
+	lastError        atomic.Pointer[string]
+	committedLogs    atomic.Uint64
+	committedSpans   atomic.Uint64
+	committedMetrics atomic.Uint64
+	deletedLogs      atomic.Uint64
+	deletedSpans     atomic.Uint64
+	deletedMetrics   atomic.Uint64
 }
 
 func NewFactory() extension.Factory {
@@ -454,9 +478,10 @@ func inspectSchema(db *sql.DB) (current bool, disposable bool, err error) {
 
 func schemaHasRequiredColumns(db *sql.DB) (bool, error) {
 	required := map[string][]string{
-		"otel_logs":      {"fingerprint", "received_at_unix_nano", "service_name", "severity_text", "body_json", "payload_json"},
-		"otel_spans":     {"fingerprint", "received_at_unix_nano", "trace_id", "span_id", "service_name", "name", "payload_json"},
-		"logal_metadata": {"key", "value"},
+		"otel_logs":          {"fingerprint", "received_at_unix_nano", "service_name", "severity_text", "body_json", "payload_json"},
+		"otel_spans":         {"fingerprint", "received_at_unix_nano", "trace_id", "span_id", "service_name", "name", "payload_json"},
+		"otel_metric_points": {"fingerprint", "received_at_unix_nano", "service_name", "metric_name", "metric_type", "payload_json"},
+		"logal_metadata":     {"key", "value"},
 	}
 	for table, columns := range required {
 		var count int
@@ -555,6 +580,24 @@ func createSchema(db *sql.DB) error {
 			payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
 			UNIQUE(trace_id, span_id)
 		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS otel_metric_points (
+			id INTEGER PRIMARY KEY,
+			fingerprint BLOB NOT NULL UNIQUE CHECK(length(fingerprint) = 32),
+			received_at_unix_nano INTEGER NOT NULL,
+			service_name TEXT NOT NULL,
+			metric_name TEXT NOT NULL,
+			metric_type TEXT NOT NULL CHECK(metric_type IN ('gauge','sum','histogram','exponential_histogram','summary')),
+			start_time_unix_nano INTEGER NOT NULL DEFAULT 0,
+			time_unix_nano INTEGER NOT NULL DEFAULT 0,
+			number_kind TEXT CHECK(number_kind IS NULL OR number_kind IN ('int','double')),
+			number_int INTEGER,
+			number_double REAL,
+			aggregate_count TEXT,
+			aggregate_sum REAL,
+			aggregate_min REAL,
+			aggregate_max REAL,
+			payload_json TEXT NOT NULL CHECK(json_valid(payload_json))
+		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_received ON otel_logs(received_at_unix_nano)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_trace ON otel_logs(trace_id, span_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_service_time ON otel_logs(service_name, time_unix_nano)`,
@@ -564,6 +607,9 @@ func createSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_spans_received ON otel_spans(received_at_unix_nano)`,
 		`CREATE INDEX IF NOT EXISTS idx_spans_trace ON otel_spans(trace_id, span_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_spans_service_start ON otel_spans(service_name, start_time_unix_nano)`,
+		`CREATE INDEX IF NOT EXISTS idx_metric_points_received ON otel_metric_points(received_at_unix_nano)`,
+		`CREATE INDEX IF NOT EXISTS idx_metric_points_service_time ON otel_metric_points(service_name, time_unix_nano)`,
+		`CREATE INDEX IF NOT EXISTS idx_metric_points_name_time ON otel_metric_points(metric_name, time_unix_nano)`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
@@ -665,6 +711,55 @@ func (s *Store) InsertSpans(ctx context.Context, records []SpanRecord) error {
 	return nil
 }
 
+func (s *Store) InsertMetricPoints(ctx context.Context, records []MetricPointRecord) error {
+	if !s.ready.Load() {
+		return errors.New("store is not ready")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.admissionErrorLocked(); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO otel_metric_points
+		(fingerprint,received_at_unix_nano,service_name,metric_name,metric_type,start_time_unix_nano,time_unix_nano,number_kind,number_int,number_double,aggregate_count,aggregate_sum,aggregate_min,aggregate_max,payload_json)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	var inserted uint64
+	for _, r := range records {
+		if !json.Valid([]byte(r.PayloadJSON)) {
+			return errors.New("metric payload is not valid JSON")
+		}
+		switch r.MetricType {
+		case "gauge", "sum", "histogram", "exponential_histogram", "summary":
+		default:
+			return fmt.Errorf("invalid metric type %q", r.MetricType)
+		}
+		if r.NumberKind != "" && r.NumberKind != "int" && r.NumberKind != "double" {
+			return fmt.Errorf("invalid metric number kind %q", r.NumberKind)
+		}
+		result, err := stmt.ExecContext(ctx, r.Fingerprint[:], r.ReceivedAt, r.ServiceName, r.MetricName, r.MetricType, r.StartTime, r.Time, nullable(r.NumberKind), r.NumberInt, r.NumberDouble, nullable(r.AggregateCount), r.AggregateSum, r.AggregateMin, r.AggregateMax, r.PayloadJSON)
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n > 0 {
+			inserted += uint64(n)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.committedMetrics.Add(inserted)
+	return nil
+}
+
 func nullable(value string) any {
 	if value == "" {
 		return nil
@@ -709,9 +804,14 @@ func (s *Store) Maintain(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	metrics, err := s.db.ExecContext(ctx, `DELETE FROM otel_metric_points WHERE id IN (SELECT id FROM otel_metric_points WHERE received_at_unix_nano < ? ORDER BY received_at_unix_nano LIMIT 5000)`, cutoff)
+	if err != nil {
+		return err
+	}
 	ln, _ := logs.RowsAffected()
 	sn, _ := spans.RowsAffected()
-	if ln+sn > 0 {
+	mn, _ := metrics.RowsAffected()
+	if ln+sn+mn > 0 {
 		if _, err := s.db.ExecContext(ctx, `PRAGMA incremental_vacuum(4096)`); err != nil {
 			return err
 		}
@@ -737,6 +837,7 @@ func (s *Store) Maintain(ctx context.Context, now time.Time) error {
 	}
 	s.deletedLogs.Add(uint64(ln))
 	s.deletedSpans.Add(uint64(sn))
+	s.deletedMetrics.Add(uint64(mn))
 	return nil
 }
 
@@ -746,11 +847,13 @@ func (s *Store) deletePressureBatch(ctx context.Context) error {
 			SELECT 0 AS signal, id, received_at_unix_nano FROM otel_logs
 			UNION ALL
 			SELECT 1 AS signal, id, received_at_unix_nano FROM otel_spans
+			UNION ALL
+			SELECT 2 AS signal, id, received_at_unix_nano FROM otel_metric_points
 		) ORDER BY received_at_unix_nano, signal, id LIMIT 5000`)
 	if err != nil {
 		return err
 	}
-	var logIDs, spanIDs []int64
+	var logIDs, spanIDs, metricIDs []int64
 	for rows.Next() {
 		var signal int
 		var id int64
@@ -758,10 +861,13 @@ func (s *Store) deletePressureBatch(ctx context.Context) error {
 			_ = rows.Close()
 			return err
 		}
-		if signal == 0 {
+		switch signal {
+		case 0:
 			logIDs = append(logIDs, id)
-		} else {
+		case 1:
 			spanIDs = append(spanIDs, id)
+		case 2:
+			metricIDs = append(metricIDs, id)
 		}
 	}
 	if err := rows.Close(); err != nil {
@@ -782,11 +888,17 @@ func (s *Store) deletePressureBatch(ctx context.Context) error {
 			return err
 		}
 	}
+	for _, id := range metricIDs {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM otel_metric_points WHERE id=?`, id); err != nil {
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	s.deletedLogs.Add(uint64(len(logIDs)))
 	s.deletedSpans.Add(uint64(len(spanIDs)))
+	s.deletedMetrics.Add(uint64(len(metricIDs)))
 	return nil
 }
 
@@ -797,6 +909,7 @@ func (s *Store) Snapshot(ctx context.Context) Snapshot {
 	if s.db != nil {
 		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_logs`).Scan(&snapshot.OldestLog)
 		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_spans`).Scan(&snapshot.OldestSpan)
+		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_metric_points`).Scan(&snapshot.OldestMetric)
 	}
 	return snapshot
 }
@@ -804,12 +917,13 @@ func (s *Store) Snapshot(ctx context.Context) Snapshot {
 // OperationalSnapshot returns the counters and capacity state without waiting
 // for the SQLite writer. It is intended for periodic health reporting.
 func (s *Store) OperationalSnapshot() Snapshot {
-	snapshot := Snapshot{Ready: s.ready.Load(), CommittedLogs: s.committedLogs.Load(), CommittedSpans: s.committedSpans.Load(), DeletedLogs: s.deletedLogs.Load(), DeletedSpans: s.deletedSpans.Load()}
+	snapshot := Snapshot{Ready: s.ready.Load(), CommittedLogs: s.committedLogs.Load(), CommittedSpans: s.committedSpans.Load(), CommittedMetrics: s.committedMetrics.Load(), DeletedLogs: s.deletedLogs.Load(), DeletedSpans: s.deletedSpans.Load(), DeletedMetrics: s.deletedMetrics.Load()}
 	snapshot.DatabaseBytes, snapshot.ActiveBytes, snapshot.FreeBytes, snapshot.WALBytes = diskState(s.cfg.Path)
 	if lastError := s.lastError.Load(); lastError != nil {
 		snapshot.LastError = *lastError
 	}
 	snapshot.Ready = snapshot.Ready && snapshot.ActiveBytes+requestReserve < activeHardLimit && snapshot.WALBytes < walNotReady && snapshot.FreeBytes >= freeDiskFloor+uint64(requestReserve)
+
 	return snapshot
 }
 

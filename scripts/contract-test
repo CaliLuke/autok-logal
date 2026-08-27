@@ -138,6 +138,169 @@ curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_PORT/
 curl --connect-timeout 1 --max-time 5 -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/traces" \
 	-H 'Content-Type: application/json' \
 	--data '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"contract"}}]},"scopeSpans":[{"spans":[{"traceId":"ffeeddccbbaa99887766554433221100","spanId":"7766554433221100","name":"other"},{"traceId":"00112233445566778899aabbccddeeff","spanId":"0011223344556677","name":"stable"}]}]}]}' >/dev/null
+read -r -d '' METRICS_BASE <<'JSON' || true
+{
+  "resourceMetrics": [{
+    "resource": {"attributes": [
+      {"key": "service.name", "value": {"stringValue": "contract"}},
+      {"key": "authorization", "value": {"stringValue": "Bearer metric-resource-secret"}}
+    ]},
+    "scopeMetrics": [{
+      "scope": {"name": "contract.metrics", "attributes": [
+        {"key": "password", "value": {"stringValue": "metric-scope-secret"}}
+      ]},
+      "metrics": [
+        {
+          "name": "contract.gauge",
+          "unit": "1",
+          "gauge": {"dataPoints": [{
+            "startTimeUnixNano": "0",
+            "timeUnixNano": "0",
+            "asInt": "1",
+            "flags": 1,
+            "attributes": [
+              {"key": "session_token", "value": {"stringValue": "metric-point-secret"}},
+              {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "123"}}
+            ],
+            "exemplars": [{
+              "filteredAttributes": [{"key": "refresh_token", "value": {"stringValue": "metric-exemplar-secret"}}],
+              "timeUnixNano": "0",
+              "asDouble": 1.5,
+              "traceId": "00112233445566778899aabbccddeeff",
+              "spanId": "0011223344556677"
+            }]
+          }]}
+        },
+        {
+          "name": "contract.sum",
+          "sum": {
+            "aggregationTemporality": 1,
+            "isMonotonic": true,
+            "dataPoints": [{"startTimeUnixNano": "10", "timeUnixNano": "20", "asInt": "7"}]
+          }
+        },
+        {
+          "name": "contract.histogram",
+          "histogram": {
+            "aggregationTemporality": 2,
+            "dataPoints": [{
+              "startTimeUnixNano": "10",
+              "timeUnixNano": "20",
+              "count": "3",
+              "sum": 6,
+              "min": 1,
+              "max": 3,
+              "explicitBounds": [1, 2],
+              "bucketCounts": ["1", "1", "1"]
+            }]
+          }
+        },
+        {
+          "name": "contract.exponential_histogram",
+          "exponentialHistogram": {
+            "aggregationTemporality": 2,
+            "dataPoints": [{
+              "startTimeUnixNano": "10",
+              "timeUnixNano": "20",
+              "count": "2",
+              "sum": 3,
+              "min": 1,
+              "max": 2,
+              "scale": 1,
+              "zeroCount": "1",
+              "zeroThreshold": 0.1,
+              "positive": {"offset": -1, "bucketCounts": ["1"]},
+              "negative": {"offset": 1, "bucketCounts": ["0"]}
+            }]
+          }
+        },
+        {
+          "name": "contract.summary",
+          "summary": {"dataPoints": [{
+            "startTimeUnixNano": "10",
+            "timeUnixNano": "20",
+            "count": "2",
+            "sum": 3,
+            "quantileValues": [
+              {"quantile": 0.5, "value": 1},
+              {"quantile": 0.99, "value": 2}
+            ]
+          }]}
+        }
+      ]
+    }]
+  }]
+}
+JSON
+
+read -r -d '' METRICS_OVERLAP <<'JSON' || true
+{
+  "resourceMetrics": [{
+    "resource": {"attributes": [
+      {"key": "service.name", "value": {"stringValue": "contract"}},
+      {"key": "authorization", "value": {"stringValue": "Bearer metric-resource-secret"}}
+    ]},
+    "scopeMetrics": [{
+      "scope": {"name": "contract.metrics", "attributes": [
+        {"key": "password", "value": {"stringValue": "metric-scope-secret"}}
+      ]},
+      "metrics": [{
+        "name": "contract.gauge",
+        "unit": "1",
+        "gauge": {"dataPoints": [
+          {
+            "startTimeUnixNano": "0",
+            "timeUnixNano": "0",
+            "asInt": "1",
+            "flags": 1,
+            "attributes": [
+              {"key": "session_token", "value": {"stringValue": "metric-point-secret"}},
+              {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "123"}}
+            ],
+            "exemplars": [{
+              "filteredAttributes": [{"key": "refresh_token", "value": {"stringValue": "metric-exemplar-secret"}}],
+              "timeUnixNano": "0",
+              "asDouble": 1.5,
+              "traceId": "00112233445566778899aabbccddeeff",
+              "spanId": "0011223344556677"
+            }]
+          },
+          {
+            "startTimeUnixNano": "0",
+            "timeUnixNano": "0",
+            "asInt": "2",
+            "attributes": [{"key": "session_token", "value": {"stringValue": "metric-point-secret"}}]
+          }
+        ]}
+      }]
+    }]
+  }]
+}
+JSON
+
+for payload in "$METRICS_BASE" "$METRICS_BASE" "$METRICS_OVERLAP"; do
+  curl -fsS -X POST "http://127.0.0.1:$OTLP_PORT/v1/metrics" \
+    -H 'Content-Type: application/json' \
+    --data "$payload" >/dev/null
+done
+
+assert_eq "6" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE service_name='contract'")" "metric deduplication"
+assert_eq "5" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(DISTINCT metric_type) FROM otel_metric_points WHERE service_name='contract'")" "metric type coverage"
+assert_eq "2" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.gauge' AND metric_type='gauge' AND number_kind='int' AND number_int IN (1,2) AND time_unix_nano=0")" "same-time metric preservation"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.gauge' AND number_int=1")" "exact metric retry deduplication"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.sum' AND metric_type='sum' AND number_kind='int' AND number_int=7")" "sum projection"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.histogram' AND aggregate_count='3' AND aggregate_sum=6 AND aggregate_min=1 AND aggregate_max=3")" "histogram projection"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.exponential_histogram' AND aggregate_count='2' AND aggregate_sum=3")" "exponential histogram projection"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.summary' AND aggregate_count='2' AND aggregate_sum=3")" "summary projection"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.histogram' AND json_array_length(json_extract(payload_json,'$.resourceMetrics[0].scopeMetrics[0].metrics[0].histogram.dataPoints[0].bucketCounts'))=3")" "histogram payload fidelity"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.exponential_histogram' AND json_extract(payload_json,'$.resourceMetrics[0].scopeMetrics[0].metrics[0].exponentialHistogram.dataPoints[0].positive.offset')=-1")" "exponential histogram payload fidelity"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.summary' AND json_array_length(json_extract(payload_json,'$.resourceMetrics[0].scopeMetrics[0].metrics[0].summary.dataPoints[0].quantileValues'))=2")" "summary payload fidelity"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.gauge' AND json_extract(payload_json,'$.resourceMetrics[0].scopeMetrics[0].metrics[0].gauge.dataPoints[0].exemplars[0].traceId')='00112233445566778899aabbccddeeff'")" "exemplar correlation"
+assert_eq "6" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE payload_json LIKE '%[REDACTED]%'")" "metric redaction markers"
+assert_eq "0" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE payload_json LIKE '%metric-resource-secret%' OR payload_json LIKE '%metric-scope-secret%' OR payload_json LIKE '%metric-point-secret%' OR payload_json LIKE '%metric-exemplar-secret%'")" "metric credential redaction"
+assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='contract.gauge' AND payload_json LIKE '%gen_ai.usage.input_tokens%' AND payload_json LIKE '%123%'")" "token count preservation"
+STATUS_JSON="$(curl --connect-timeout 1 --max-time 5 -fsS "http://127.0.0.1:$HEALTH_PORT/status")"
+[[ "$STATUS_JSON" == *'"committed_metric_points":6'* ]] || fail "status metric counter"
 
 assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE service_name='contract'")" "log deduplication"
 assert_eq "0" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE payload_json LIKE '%must-not-persist%'")" "log payload redaction"
@@ -146,10 +309,6 @@ assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WH
 assert_eq "1" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_logs WHERE op='contract.frontend.ready' AND request_id='request-123' AND product_id='product-456' AND component='frontend'")" "correlation field extraction"
 assert_eq "2" "$(sqlite3 -readonly "$DB_PATH" "SELECT COUNT(*) FROM otel_spans WHERE service_name='contract'")" "span deduplication"
 
-metrics_status="$(curl --connect-timeout 1 --max-time 5 -sS -o /dev/null -w '%{http_code}' \
-	-X POST "http://127.0.0.1:$OTLP_PORT/v1/metrics" \
-	-H 'Content-Type: application/json' --data '{}')"
-assert_eq "404" "$metrics_status" "unsupported metrics response"
 
 kill -0 "$PID" 2>/dev/null || fail "Logal exited before graceful shutdown"
 assert_graceful_shutdown

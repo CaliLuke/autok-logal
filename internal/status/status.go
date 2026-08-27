@@ -124,7 +124,7 @@ func (s *Status) Dependencies() []component.ID { return []component.ID{component
 func (s *Status) GetHTTPHandler(context.Context) (extensionmiddleware.WrapHTTPHandlerFunc, error) {
 	return func(_ context.Context, next http.Handler) (http.Handler, error) {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost || (r.URL.Path != "/v1/logs" && r.URL.Path != "/v1/traces") {
+			if r.Method != http.MethodPost || (r.URL.Path != "/v1/logs" && r.URL.Path != "/v1/traces" && r.URL.Path != "/v1/metrics") {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -196,8 +196,10 @@ func (s *Status) currentActivityState() activityState {
 func activityChanged(previous, current activityState) bool {
 	return previous.store.CommittedLogs != current.store.CommittedLogs ||
 		previous.store.CommittedSpans != current.store.CommittedSpans ||
+		previous.store.CommittedMetrics != current.store.CommittedMetrics ||
 		previous.store.DeletedLogs != current.store.DeletedLogs ||
 		previous.store.DeletedSpans != current.store.DeletedSpans ||
+		previous.store.DeletedMetrics != current.store.DeletedMetrics ||
 		previous.store.Ready != current.store.Ready ||
 		previous.store.LastError != current.store.LastError ||
 		previous.pipelineReady != current.pipelineReady ||
@@ -209,10 +211,13 @@ func (s *Status) logActivity(previous, current activityState) {
 		zap.Bool("ready", current.pipelineReady && current.store.Ready && current.inFlight < int64(s.cfg.MaxInFlight)),
 		zap.Uint64("logs_written", counterDelta(previous.store.CommittedLogs, current.store.CommittedLogs)),
 		zap.Uint64("spans_written", counterDelta(previous.store.CommittedSpans, current.store.CommittedSpans)),
+		zap.Uint64("metric_points_written", counterDelta(previous.store.CommittedMetrics, current.store.CommittedMetrics)),
 		zap.Uint64("logs_total", current.store.CommittedLogs),
 		zap.Uint64("spans_total", current.store.CommittedSpans),
+		zap.Uint64("metric_points_total", current.store.CommittedMetrics),
 		zap.Uint64("logs_deleted", counterDelta(previous.store.DeletedLogs, current.store.DeletedLogs)),
 		zap.Uint64("spans_deleted", counterDelta(previous.store.DeletedSpans, current.store.DeletedSpans)),
+		zap.Uint64("metric_points_deleted", counterDelta(previous.store.DeletedMetrics, current.store.DeletedMetrics)),
 		zap.Uint64("requests_rejected", counterDelta(previous.rejected, current.rejected)),
 		zap.Int64("in_flight", current.inFlight),
 		zap.Int64("database_bytes", current.store.DatabaseBytes),
