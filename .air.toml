@@ -10,7 +10,7 @@ exclude_regex = ["_test\\.go"]
 delay = 300
 stop_on_error = false
 send_interrupt = true
-kill_delay = "2s"
+kill_delay = "10s"
 
 [log]
 time = true

@@ -1,12 +1,15 @@
 package exporter
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,7 +19,6 @@ import (
 	collexporter "go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
-	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -25,11 +27,6 @@ import (
 var Type = component.MustNewType("logal_sqlite")
 
 const maxPersistedRequestBytes = 64 << 20
-
-const (
-	maxMetricDescriptors = 10000
-	maxMetricPoints      = 10000
-)
 
 type Config struct {
 	Store string `mapstructure:"store"`
@@ -44,11 +41,6 @@ type tracesExporter struct {
 	store *store.Store
 }
 
-type metricsExporter struct {
-	cfg   Config
-	store *store.Store
-}
-
 func NewFactory() collexporter.Factory {
 	return collexporter.NewFactory(Type, func() component.Config { return &Config{Store: "logal_store"} },
 		collexporter.WithLogs(func(_ context.Context, _ collexporter.Settings, cfg component.Config) (collexporter.Logs, error) {
@@ -56,9 +48,6 @@ func NewFactory() collexporter.Factory {
 		}, component.StabilityLevelAlpha),
 		collexporter.WithTraces(func(_ context.Context, _ collexporter.Settings, cfg component.Config) (collexporter.Traces, error) {
 			return &tracesExporter{cfg: *cfg.(*Config)}, nil
-		}, component.StabilityLevelAlpha),
-		collexporter.WithMetrics(func(_ context.Context, _ collexporter.Settings, cfg component.Config) (collexporter.Metrics, error) {
-			return &metricsExporter{cfg: *cfg.(*Config)}, nil
 		}, component.StabilityLevelAlpha),
 	)
 }
@@ -81,16 +70,6 @@ func (e *tracesExporter) Shutdown(context.Context) error { return nil }
 func (e *tracesExporter) Capabilities() consumer.Capabilities {
 	return consumer.Capabilities{MutatesData: false}
 }
-func (e *metricsExporter) Start(_ context.Context, host component.Host) error {
-	var err error
-	e.store, err = store.Find(host, e.cfg.Store)
-	return err
-}
-func (e *metricsExporter) Shutdown(context.Context) error { return nil }
-func (e *metricsExporter) Capabilities() consumer.Capabilities {
-	return consumer.Capabilities{MutatesData: false}
-}
-
 func (e *logsExporter) ConsumeLogs(ctx context.Context, data plog.Logs) error {
 	if data.LogRecordCount() > 10000 {
 		return status.Error(codes.InvalidArgument, "log request exceeds 10000 records")
@@ -116,7 +95,13 @@ func (e *logsExporter) ConsumeLogs(ctx context.Context, data plog.Logs) error {
 			}
 			logs := scopeLogs.LogRecords()
 			for li := 0; li < logs.Len(); li++ {
+				if err := ctx.Err(); err != nil {
+					return exportError(err)
+				}
 				record := logs.At(li)
+				if uint64(record.Timestamp()) > math.MaxInt64 {
+					return status.Error(codes.InvalidArgument, "log timestamp exceeds SQLite integer range")
+				}
 				if err := validateValue(record.Body(), 0); err != nil {
 					return status.Error(codes.InvalidArgument, "invalid log body: "+err.Error())
 				}
@@ -137,13 +122,20 @@ func (e *logsExporter) ConsumeLogs(ctx context.Context, data plog.Logs) error {
 				bodyValue := pcommon.NewValueEmpty()
 				record.Body().CopyTo(bodyValue)
 				redactValue(bodyValue)
-				body, _ := json.Marshal(taggedValue(bodyValue))
+				body, err := json.Marshal(taggedValue(bodyValue))
+				if err != nil {
+					return status.Error(codes.InvalidArgument, "encode log body: "+err.Error())
+				}
+				persistedBytes += len(body)
+				if persistedBytes > maxPersistedRequestBytes {
+					return status.Error(codes.InvalidArgument, "persisted log payload exceeds 64 MiB")
+				}
 				records = append(records, store.LogRecord{Fingerprint: fingerprint, ReceivedAt: now, Time: int64(record.Timestamp()), ServiceName: serviceName, SeverityNumber: int32(record.SeverityNumber()), SeverityText: record.SeverityText(), TraceID: nonZeroTraceID(traceID), SpanID: nonZeroSpanID(spanID), RequestID: attributeString(attrs, "request.id"), ProductID: attributeString(attrs, "autok.product.id"), Component: attributeString(attrs, "app.component"), Op: first(attributeString(attrs, "event.name"), record.EventName()), BodyJSON: string(body), PayloadJSON: string(payload)})
 			}
 		}
 	}
 	if err := e.store.InsertLogs(ctx, records); err != nil {
-		return status.Error(codes.Unavailable, err.Error())
+		return exportError(err)
 	}
 	return nil
 }
@@ -173,7 +165,13 @@ func (e *tracesExporter) ConsumeTraces(ctx context.Context, data ptrace.Traces) 
 			}
 			spans := scopeSpans.Spans()
 			for pi := 0; pi < spans.Len(); pi++ {
+				if err := ctx.Err(); err != nil {
+					return exportError(err)
+				}
 				span := spans.At(pi)
+				if uint64(span.StartTimestamp()) > math.MaxInt64 || uint64(span.EndTimestamp()) > math.MaxInt64 {
+					return status.Error(codes.InvalidArgument, "span timestamp exceeds SQLite integer range")
+				}
 				traceID, spanID := span.TraceID(), span.SpanID()
 				if traceID.IsEmpty() || spanID.IsEmpty() {
 					return status.Error(codes.InvalidArgument, "span trace_id and span_id are required")
@@ -206,207 +204,22 @@ func (e *tracesExporter) ConsumeTraces(ctx context.Context, data ptrace.Traces) 
 		}
 	}
 	if err := e.store.InsertSpans(ctx, records); err != nil {
-		if strings.Contains(err.Error(), "identity conflicts") {
+		if errors.Is(err, store.ErrSpanConflict) {
 			return status.Error(codes.InvalidArgument, err.Error())
 		}
-		return status.Error(codes.Unavailable, err.Error())
+		return exportError(err)
 	}
 	return nil
 }
 
-func (e *metricsExporter) ConsumeMetrics(ctx context.Context, data pmetric.Metrics) error {
-	if data.MetricCount() > maxMetricDescriptors {
-		return status.Errorf(codes.InvalidArgument, "metric request exceeds %d descriptors", maxMetricDescriptors)
+func exportError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return status.FromContextError(err).Err()
 	}
-	if data.DataPointCount() > maxMetricPoints {
-		return status.Errorf(codes.InvalidArgument, "metric request exceeds %d points", maxMetricPoints)
-	}
-	receivedAt := time.Now().UnixNano()
-	records := make([]store.MetricPointRecord, 0, data.DataPointCount())
-	persistedBytes := 0
-	resources := data.ResourceMetrics()
-	for resourceIndex := range resources.Len() {
-		resource := resources.At(resourceIndex)
-		if err := validateMap(resource.Resource().Attributes()); err != nil {
-			return status.Error(codes.InvalidArgument, "invalid metric resource attributes: "+err.Error())
-		}
-		serviceName := attributeString(resource.Resource().Attributes(), "service.name")
-		if serviceName == "" {
-			serviceName = "unknown_service"
-		}
-		scopes := resource.ScopeMetrics()
-		for scopeIndex := range scopes.Len() {
-			scopeMetrics := scopes.At(scopeIndex)
-			if err := validateMap(scopeMetrics.Scope().Attributes()); err != nil {
-				return status.Error(codes.InvalidArgument, "invalid metric scope attributes: "+err.Error())
-			}
-			metrics := scopeMetrics.Metrics()
-			for metricIndex := range metrics.Len() {
-				metric := metrics.At(metricIndex)
-				if metric.Type() == pmetric.MetricTypeEmpty {
-					return status.Error(codes.InvalidArgument, "metric data type is required")
-				}
-				if err := validateMap(metric.Metadata()); err != nil {
-					return status.Error(codes.InvalidArgument, "invalid metric metadata: "+err.Error())
-				}
-				pointCount := metricDataPointCount(metric)
-				for pointIndex := range pointCount {
-					if err := validateMetricPoint(metric, pointIndex); err != nil {
-						return status.Error(codes.InvalidArgument, err.Error())
-					}
-					payload, err := marshalSingleMetricPoint(resource, scopeMetrics, metric, pointIndex)
-					if err != nil {
-						return status.Error(codes.InvalidArgument, err.Error())
-					}
-					persistedBytes += len(payload)
-					if persistedBytes > maxPersistedRequestBytes {
-						return status.Error(codes.InvalidArgument, "persisted metric payload exceeds 64 MiB")
-					}
-					record := projectMetricPoint(metric, pointIndex)
-					record.Fingerprint = sha256.Sum256(payload)
-					record.ReceivedAt = receivedAt
-					record.ServiceName = serviceName
-					record.MetricName = metric.Name()
-					record.PayloadJSON = string(payload)
-					records = append(records, record)
-				}
-			}
-		}
-	}
-	if err := e.store.InsertMetricPoints(ctx, records); err != nil {
-		return status.Error(codes.Unavailable, err.Error())
-	}
-	return nil
-}
-
-func metricDataPointCount(metric pmetric.Metric) int {
-	switch metric.Type() {
-	case pmetric.MetricTypeGauge:
-		return metric.Gauge().DataPoints().Len()
-	case pmetric.MetricTypeSum:
-		return metric.Sum().DataPoints().Len()
-	case pmetric.MetricTypeHistogram:
-		return metric.Histogram().DataPoints().Len()
-	case pmetric.MetricTypeExponentialHistogram:
-		return metric.ExponentialHistogram().DataPoints().Len()
-	case pmetric.MetricTypeSummary:
-		return metric.Summary().DataPoints().Len()
-	default:
-		return 0
-	}
-}
-
-func validateMetricPoint(metric pmetric.Metric, pointIndex int) error {
-	var attributes pcommon.Map
-	var exemplars pmetric.ExemplarSlice
-	hasExemplars := false
-	switch metric.Type() {
-	case pmetric.MetricTypeGauge:
-		point := metric.Gauge().DataPoints().At(pointIndex)
-		attributes, exemplars = point.Attributes(), point.Exemplars()
-		hasExemplars = true
-	case pmetric.MetricTypeSum:
-		point := metric.Sum().DataPoints().At(pointIndex)
-		attributes, exemplars = point.Attributes(), point.Exemplars()
-		hasExemplars = true
-	case pmetric.MetricTypeHistogram:
-		point := metric.Histogram().DataPoints().At(pointIndex)
-		attributes, exemplars = point.Attributes(), point.Exemplars()
-		hasExemplars = true
-	case pmetric.MetricTypeExponentialHistogram:
-		point := metric.ExponentialHistogram().DataPoints().At(pointIndex)
-		attributes, exemplars = point.Attributes(), point.Exemplars()
-		hasExemplars = true
-	case pmetric.MetricTypeSummary:
-		attributes = metric.Summary().DataPoints().At(pointIndex).Attributes()
-	default:
-		return fmt.Errorf("metric data type is required")
-	}
-	if err := validateMap(attributes); err != nil {
-		return fmt.Errorf("invalid metric point attributes: %w", err)
-	}
-	if hasExemplars {
-		for exemplarIndex := range exemplars.Len() {
-			if err := validateMap(exemplars.At(exemplarIndex).FilteredAttributes()); err != nil {
-				return fmt.Errorf("invalid metric exemplar attributes: %w", err)
-			}
-		}
-	}
-	return nil
-}
-
-func projectMetricPoint(metric pmetric.Metric, pointIndex int) store.MetricPointRecord {
-	record := store.MetricPointRecord{}
-	switch metric.Type() {
-	case pmetric.MetricTypeGauge:
-		record.MetricType = "gauge"
-		projectNumberPoint(metric.Gauge().DataPoints().At(pointIndex), &record)
-	case pmetric.MetricTypeSum:
-		record.MetricType = "sum"
-		projectNumberPoint(metric.Sum().DataPoints().At(pointIndex), &record)
-	case pmetric.MetricTypeHistogram:
-		record.MetricType = "histogram"
-		point := metric.Histogram().DataPoints().At(pointIndex)
-		record.StartTime, record.Time = int64(point.StartTimestamp()), int64(point.Timestamp())
-		record.AggregateCount = fmt.Sprint(point.Count())
-		if point.HasSum() {
-			record.AggregateSum = finiteFloat(point.Sum())
-		}
-		if point.HasMin() {
-			record.AggregateMin = finiteFloat(point.Min())
-		}
-		if point.HasMax() {
-			record.AggregateMax = finiteFloat(point.Max())
-		}
-	case pmetric.MetricTypeExponentialHistogram:
-		record.MetricType = "exponential_histogram"
-		point := metric.ExponentialHistogram().DataPoints().At(pointIndex)
-		record.StartTime, record.Time = int64(point.StartTimestamp()), int64(point.Timestamp())
-		record.AggregateCount = fmt.Sprint(point.Count())
-		if point.HasSum() {
-			record.AggregateSum = finiteFloat(point.Sum())
-		}
-		if point.HasMin() {
-			record.AggregateMin = finiteFloat(point.Min())
-		}
-		if point.HasMax() {
-			record.AggregateMax = finiteFloat(point.Max())
-		}
-	case pmetric.MetricTypeSummary:
-		record.MetricType = "summary"
-		point := metric.Summary().DataPoints().At(pointIndex)
-		record.StartTime, record.Time = int64(point.StartTimestamp()), int64(point.Timestamp())
-		record.AggregateCount = fmt.Sprint(point.Count())
-		record.AggregateSum = finiteFloat(point.Sum())
-	}
-	return record
-}
-
-func projectNumberPoint(point pmetric.NumberDataPoint, record *store.MetricPointRecord) {
-	record.StartTime, record.Time = int64(point.StartTimestamp()), int64(point.Timestamp())
-	switch point.ValueType() {
-	case pmetric.NumberDataPointValueTypeInt:
-		record.NumberKind = "int"
-		value := point.IntValue()
-		record.NumberInt = &value
-	case pmetric.NumberDataPointValueTypeDouble:
-		record.NumberKind = "double"
-		record.NumberDouble = finiteFloat(point.DoubleValue())
-	}
-}
-
-func finiteFloat(value float64) *float64 {
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return nil
-	}
-	return &value
+	return status.Error(codes.Unavailable, err.Error())
 }
 
 func taggedValue(value pcommon.Value) any {
-	return taggedValueAtDepth(value, 0)
-}
-
-func taggedValueAtDepth(value pcommon.Value, depth int) any {
 	switch value.Type() {
 	case pcommon.ValueTypeEmpty:
 		return map[string]any{"empty": true}
@@ -433,13 +246,13 @@ func taggedValueAtDepth(value pcommon.Value, depth int) any {
 	case pcommon.ValueTypeSlice:
 		items := make([]any, 0, value.Slice().Len())
 		for i := 0; i < value.Slice().Len(); i++ {
-			items = append(items, taggedValueAtDepth(value.Slice().At(i), depth+1))
+			items = append(items, taggedValue(value.Slice().At(i)))
 		}
 		return map[string]any{"array": items}
 	case pcommon.ValueTypeMap:
 		items := make([]map[string]any, 0, value.Map().Len())
 		value.Map().Range(func(key string, child pcommon.Value) bool {
-			items = append(items, map[string]any{"key": key, "value": taggedValueAtDepth(child, depth+1)})
+			items = append(items, map[string]any{"key": key, "value": taggedValue(child)})
 			return true
 		})
 		return map[string]any{"map": items}
@@ -448,12 +261,7 @@ func taggedValueAtDepth(value pcommon.Value, depth int) any {
 }
 
 func validateMap(values pcommon.Map) error {
-	var validationErr error
-	values.Range(func(_ string, value pcommon.Value) bool {
-		validationErr = validateValue(value, 0)
-		return validationErr == nil
-	})
-	return validationErr
+	return validateMapAtDepth(values, 0)
 }
 
 func validateValue(value pcommon.Value, depth int) error {
@@ -482,8 +290,15 @@ func validateValue(value pcommon.Value, depth int) error {
 }
 
 func validateMapAtDepth(values pcommon.Map, depth int) error {
+	if depth > 16 {
+		return fmt.Errorf("nesting exceeds 16 levels")
+	}
 	var validationErr error
-	values.Range(func(_ string, value pcommon.Value) bool {
+	values.Range(func(key string, value pcommon.Value) bool {
+		if len(key) > 1<<20 {
+			validationErr = errors.New("attribute key exceeds 1 MiB")
+			return false
+		}
 		validationErr = validateValue(value, depth)
 		return validationErr == nil
 	})
@@ -504,7 +319,8 @@ func marshalSingleLog(resource plog.ResourceLogs, scope plog.ScopeLogs, record p
 	targetRecord := targetScope.LogRecords().At(0)
 	redactMap(targetRecord.Attributes())
 	redactValue(targetRecord.Body())
-	return (&plog.JSONMarshaler{}).MarshalLogs(single)
+	payload, err := (&plog.JSONMarshaler{}).MarshalLogs(single)
+	return canonicalPayload(payload, err)
 }
 
 func marshalSingleSpan(resource ptrace.ResourceSpans, scope ptrace.ScopeSpans, span ptrace.Span) ([]byte, error) {
@@ -526,81 +342,44 @@ func marshalSingleSpan(resource ptrace.ResourceSpans, scope ptrace.ScopeSpans, s
 	for linkIndex := 0; linkIndex < targetSpan.Links().Len(); linkIndex++ {
 		redactMap(targetSpan.Links().At(linkIndex).Attributes())
 	}
-	return (&ptrace.JSONMarshaler{}).MarshalTraces(single)
+	payload, err := (&ptrace.JSONMarshaler{}).MarshalTraces(single)
+	return canonicalPayload(payload, err)
 }
 
-func marshalSingleMetricPoint(resource pmetric.ResourceMetrics, scope pmetric.ScopeMetrics, metric pmetric.Metric, pointIndex int) ([]byte, error) {
-	single := pmetric.NewMetrics()
-	targetResource := single.ResourceMetrics().AppendEmpty()
-	resource.Resource().CopyTo(targetResource.Resource())
-	targetResource.SetSchemaUrl(resource.SchemaUrl())
-	targetScope := targetResource.ScopeMetrics().AppendEmpty()
-	scope.Scope().CopyTo(targetScope.Scope())
-	targetScope.SetSchemaUrl(scope.SchemaUrl())
-	targetMetric := targetScope.Metrics().AppendEmpty()
-	targetMetric.SetName(metric.Name())
-	targetMetric.SetDescription(metric.Description())
-	targetMetric.SetUnit(metric.Unit())
-	metric.Metadata().CopyTo(targetMetric.Metadata())
-	switch metric.Type() {
-	case pmetric.MetricTypeGauge:
-		metric.Gauge().DataPoints().At(pointIndex).CopyTo(targetMetric.SetEmptyGauge().DataPoints().AppendEmpty())
-	case pmetric.MetricTypeSum:
-		source := metric.Sum()
-		target := targetMetric.SetEmptySum()
-		target.SetAggregationTemporality(source.AggregationTemporality())
-		target.SetIsMonotonic(source.IsMonotonic())
-		source.DataPoints().At(pointIndex).CopyTo(target.DataPoints().AppendEmpty())
-	case pmetric.MetricTypeHistogram:
-		source := metric.Histogram()
-		target := targetMetric.SetEmptyHistogram()
-		target.SetAggregationTemporality(source.AggregationTemporality())
-		source.DataPoints().At(pointIndex).CopyTo(target.DataPoints().AppendEmpty())
-	case pmetric.MetricTypeExponentialHistogram:
-		source := metric.ExponentialHistogram()
-		target := targetMetric.SetEmptyExponentialHistogram()
-		target.SetAggregationTemporality(source.AggregationTemporality())
-		source.DataPoints().At(pointIndex).CopyTo(target.DataPoints().AppendEmpty())
-	case pmetric.MetricTypeSummary:
-		metric.Summary().DataPoints().At(pointIndex).CopyTo(targetMetric.SetEmptySummary().DataPoints().AppendEmpty())
-	default:
-		return nil, fmt.Errorf("metric data type is required")
+// Canonicalize only OTLP key/value lists. Event and array order remains intact.
+// Sorting JSON avoids quadratic insertion into pdata's slice-backed maps.
+func canonicalPayload(payload []byte, marshalErr error) ([]byte, error) {
+	if marshalErr != nil {
+		return nil, marshalErr
 	}
-	redactMap(targetResource.Resource().Attributes())
-	redactMap(targetScope.Scope().Attributes())
-	redactMap(targetMetric.Metadata())
-	redactMetricPoint(targetMetric)
-	return (&pmetric.JSONMarshaler{}).MarshalMetrics(single)
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber() // Preserve integers that exceed float64 precision.
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	canonicalize(value, "")
+	return json.Marshal(value)
 }
 
-func redactMetricPoint(metric pmetric.Metric) {
-	var attributes pcommon.Map
-	var exemplars pmetric.ExemplarSlice
-	hasExemplars := false
-	switch metric.Type() {
-	case pmetric.MetricTypeGauge:
-		point := metric.Gauge().DataPoints().At(0)
-		attributes, exemplars = point.Attributes(), point.Exemplars()
-		hasExemplars = true
-	case pmetric.MetricTypeSum:
-		point := metric.Sum().DataPoints().At(0)
-		attributes, exemplars = point.Attributes(), point.Exemplars()
-		hasExemplars = true
-	case pmetric.MetricTypeHistogram:
-		point := metric.Histogram().DataPoints().At(0)
-		attributes, exemplars = point.Attributes(), point.Exemplars()
-		hasExemplars = true
-	case pmetric.MetricTypeExponentialHistogram:
-		point := metric.ExponentialHistogram().DataPoints().At(0)
-		attributes, exemplars = point.Attributes(), point.Exemplars()
-		hasExemplars = true
-	case pmetric.MetricTypeSummary:
-		attributes = metric.Summary().DataPoints().At(0).Attributes()
-	}
-	redactMap(attributes)
-	if hasExemplars {
-		for exemplarIndex := range exemplars.Len() {
-			redactMap(exemplars.At(exemplarIndex).FilteredAttributes())
+func canonicalize(value any, parent string) {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if key == "attributes" || (parent == "kvlistValue" && key == "values") {
+				if entries, ok := child.([]any); ok {
+					sort.SliceStable(entries, func(i, j int) bool {
+						left, _ := entries[i].(map[string]any)["key"].(string)
+						right, _ := entries[j].(map[string]any)["key"].(string)
+						return left < right
+					})
+				}
+			}
+			canonicalize(child, key)
+		}
+	case []any:
+		for _, child := range value {
+			canonicalize(child, parent)
 		}
 	}
 }
@@ -652,10 +431,10 @@ func isSensitiveKey(key string) bool {
 
 func attributeString(attrs pcommon.Map, key string) string {
 	value, ok := attrs.Get(key)
-	if !ok {
+	if !ok || value.Type() != pcommon.ValueTypeStr {
 		return ""
 	}
-	return value.AsString()
+	return value.Str()
 }
 func first(values ...string) string {
 	for _, value := range values {

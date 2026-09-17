@@ -12,9 +12,13 @@ receivers:
       grpc:
         endpoint: ${env:LOGAL_OTLP_GRPC_ENDPOINT}
         max_recv_msg_size_mib: 4
+        middlewares:
+          - id: logal_status
       http:
         endpoint: ${env:LOGAL_OTLP_HTTP_ENDPOINT}
         max_request_body_size: 4194304
+        read_header_timeout: 2s
+        read_timeout: 10s
         middlewares:
           - id: logal_status
         cors:
@@ -32,8 +36,6 @@ exporters:
     store: logal_store
   logal_sqlite/traces:
     store: logal_store
-  logal_sqlite/metrics:
-    store: logal_store
 
 service:
   telemetry:
@@ -47,6 +49,3 @@ service:
     traces:
       receivers: [otlp]
       exporters: [logal_sqlite/traces]
-    metrics:
-      receivers: [otlp]
-      exporters: [logal_sqlite/metrics]

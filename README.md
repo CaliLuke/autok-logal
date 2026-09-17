@@ -1,14 +1,17 @@
 # autok-logal
 
-Logal is Auto-K's local OpenTelemetry collector for logs, traces, and metrics.
+Logal is Auto-K's local OpenTelemetry collector for logs and traces.
 It accepts OTLP/gRPC and OTLP/HTTP telemetry from local applications and persists a recent,
 queryable window in `../otel.debug.sqlite`.
+
+Schema version 6 supports logs and traces. The next start resets an older
+disposable database, including all telemetry in schema version 5.
 
 This is disposable development infrastructure, not a production observability
 platform. The most important rule is:
 
 > Logal is the only process allowed to open `otel.debug.sqlite` read-write.
-> Applications export OTLP logs, traces, and metrics; they never write the database.
+> Applications export OTLP logs and traces. They never write the database.
 
 ## Agent quick start
 
@@ -51,10 +54,7 @@ frontend / admin / auth / server
         ▼
 Official OpenTelemetry OTLP receiver
         │
-        ▼
-OpenTelemetry HTTP receiver
-        │
-        ├── logal_status middleware: readiness + admission limit
+        ├── logal_status middleware: shared HTTP/gRPC admission limit
         │
         ▼
 logal_sqlite exporters: validate + redact + normalize
@@ -74,12 +74,12 @@ are:
 | Path | Responsibility |
 | --- | --- |
 | `cmd/logal/main.go` | Registers only the OTLP receiver, Logal exporters, store, and status extension. |
-| `config/local.yaml` | Wires the logs, traces, and metrics pipelines and binds their local endpoints. |
-| `internal/exporter` | Validates OTLP values, redacts sensitive fields, extracts query columns, and creates one SQLite record per log, span, or metric point. |
+| `config/local.yaml` | Wires the logs and traces pipelines and binds their local endpoints. |
+| `internal/exporter` | Validates OTLP values, redacts sensitive fields, extracts query columns, and creates one SQLite record per log or span. |
 | `internal/store` | Owns SQLite, verifies schema ownership, serializes writes, deduplicates records, enforces capacity, and performs retention. |
 | `internal/status` | Exposes health/status endpoints, limits concurrent requests, counts rejections, and emits operational summaries. |
 | `scripts/run` | Applies defaults and launches Air, or runs a direct one-shot binary when watching is disabled. |
-| `scripts/contract-test` | Starts a temporary Logal and verifies three-signal ingestion, fidelity, redaction, and deduplication. |
+| `scripts/contract-test` | Starts a temporary Logal and verifies log and trace ingestion, fidelity, redaction, and deduplication. |
 | `scripts/reset-db` | Refuses active files/ports and requires explicit confirmation before deleting the disposable database. |
 
 ## Scope and invariants
@@ -92,7 +92,7 @@ Keep these constraints intact when changing Logal:
 - Logal attempts to recognize and refuse foreign SQLite databases, but that
   check is defense in depth rather than permission to use an untrusted path.
 - Symlinked, non-regular, or already-open database files are refused.
-- Logs, traces, and metrics share one database, retention policy, and pressure
+- Logs and traces share one database, retention policy, and pressure
   policy.
 - The collector binds to loopback and is intended only for local development.
 - Apps communicate over standard OTLP/gRPC or OTLP/HTTP and must not share Logal's SQLite writer.
@@ -154,7 +154,7 @@ The parent [`stack.toml`](../stack.toml) declares Logal with:
 - automatic restart if the service process exits unexpectedly.
 
 Air remains the long-running child of the stack service. A successful rebuild
-sends Logal `SIGINT`, gives it up to two seconds to shut down gracefully, and
+sends Logal `SIGINT`, gives it up to ten seconds to shut down gracefully, and
 then starts the new binary. A compilation failure leaves the last good process
 running. Restart the Logal service once after changing `.air.toml` or
 `scripts/run`; Air cannot replace its own launcher configuration in place. In
@@ -189,7 +189,7 @@ variables provide machine-specific paths, full bind endpoints, and limits:
 | `LOGAL_OTLP_GRPC_ENDPOINT` | `127.0.0.1:4317` | Full OTLP/gRPC bind endpoint. |
 | `LOGAL_OTLP_HTTP_ENDPOINT` | `127.0.0.1:4318` | Full OTLP/HTTP bind endpoint. |
 | `LOGAL_HEALTH_ENDPOINT` | `127.0.0.1:13133` | Full health/status bind endpoint. |
-| `LOGAL_MAX_IN_FLIGHT_REQUESTS` | `8` | HTTP admission limit shared by all HTTP signal paths. |
+| `LOGAL_MAX_IN_FLIGHT_REQUESTS` | `8` | Admission limit shared by HTTP and gRPC exports. |
 | `AUTOK_LOGAL_CONFIG_PATH` | `autok-logal/config/local.yaml` | Auto-K runner configuration file. |
 | `AUTOK_LOGAL_WATCH` | `1` | Set to `0` to bypass Air. |
 | `AUTOK_LOGAL_BINARY_PATH` | `autok-logal/bin/logal` | Direct-mode binary path; ignored by Air mode. |
@@ -219,7 +219,9 @@ The default receiver accepts OTLP/gRPC on `127.0.0.1:4317` and OTLP/HTTP on:
 
 - `POST http://127.0.0.1:4318/v1/logs`
 - `POST http://127.0.0.1:4318/v1/traces`
-- `POST http://127.0.0.1:4318/v1/metrics`
+
+Metrics are unsupported. HTTP metric exports return `404`. gRPC metric exports
+return `Unimplemented`. A separate metrics schema must precede metrics support.
 
 Both protocols feed the same official Collector receiver, exporters, store,
 transactions, retention, and deduplication path. The HTTP and gRPC receive
@@ -253,8 +255,8 @@ On startup, the store performs this sequence before reporting ready:
 On graceful shutdown, ingestion becomes not-ready first. Logal stops its
 reporter and HTTP status server, drains the collector lifecycle, stops
 maintenance, checkpoints the WAL with `TRUNCATE`, closes SQLite, releases the
-file lock, and removes the `.lock` file. Air reloads and stack quits use this
-path, so their shutdown lines should remain visible in the TUI.
+file lock. The `.lock` file remains in place so each process uses the same lock
+inode. A checkpoint failure still closes SQLite and releases ownership.
 
 Read-only SQLite processes are safe while Logal is already running, but close
 them promptly. A lingering `sqlite3` shell can prevent the next Air reload or
@@ -268,7 +270,8 @@ descriptor.
 Each OTLP record is normalized and committed transactionally:
 
 - `otel_logs` has one row per log record. Its SHA-256 fingerprint is unique, so
-  an identical redacted record is ignored on replay.
+  an identical redacted record is ignored on replay. Attribute order does not
+  affect the fingerprint.
 - `otel_spans` has one row per span and is unique on `(trace_id, span_id)`. An
   identical replay is ignored; different content for an existing identity
   rejects the transaction as invalid.
@@ -278,7 +281,9 @@ Each OTLP record is normalized and committed transactionally:
 - `trace_id`, `span_id`, and `parent_span_id` are binary blobs. Use `hex(...)`
   in SQLite output.
 
-Frequently queried attributes are copied into dedicated columns:
+Logal copies string attributes into dedicated query columns. Maps, arrays, and
+other types remain in the redacted payload and cannot leak nested secrets into
+these columns:
 
 | OTLP field/attribute | SQLite column |
 | --- | --- |
@@ -293,22 +298,27 @@ request/time, product/time, and component/time. The span table indexes received
 time, trace/span identity, and service/start time. Span `request_id` and
 `product_id` are extracted for filtering but are not separately indexed.
 
-Sensitive keys are recursively replaced with `[REDACTED]` before fingerprinting
-or persistence. Matching is case-insensitive, ignores `.`, `_`, and `-`, and
-recognizes fragments such as `authorization`, `cookie`, `password`, `passwd`,
-`token`, `secret`, and `apikey`. This is a safety net, not authorization to put
-secrets in telemetry; producers should still avoid emitting them.
+Logal replaces recognized sensitive fields with `[REDACTED]` before persistence.
+The matcher recognizes `authorization`, `cookie`, `set_cookie`, `password`,
+`passwd`, `secret`, `api_key`, and named credential tokens such as `access_token`.
+It also checks nested maps, log bodies, span events, and span links.
+Numeric token counts such as `gen_ai.usage.input_tokens` remain intact.
+Free-text messages are not scanned for secrets. Producers must exclude secrets
+from those messages.
 
 ### Retention and capacity protection
 
 Maintenance runs every 30 seconds. It deletes expired logs and spans in bounded
-batches, performs incremental vacuuming, and checkpoints the WAL.
+batches, performs incremental vacuuming, and checkpoints the WAL. Each maintenance
+cycle has a five-second deadline. A blocked checkpoint stops pressure eviction
+until a later cycle. Logal reclaims existing free pages before it deletes fresh records.
+SQLite reports blocked checkpoints through [result rows](https://www.sqlite.org/pragma.html#pragma_wal_checkpoint).
 
 Logal begins deleting the oldest telemetry under storage pressure. Current
 guardrails are:
 
 - 2 GiB main-database high-water mark;
-- 3 GiB active database/WAL/SHM hard limit, with 64 MiB reserved for a request;
+- 3 GiB admission threshold for the database/WAL/SHM, with a 64 MiB request reserve;
 - 5 GiB free-disk floor, plus the request reserve;
 - 256 MiB WAL readiness limit.
 
@@ -333,7 +343,7 @@ curl -sS http://127.0.0.1:13133/status | jq
 `committed_*`, `deleted_*`, and `rejected_requests` are counters for the current
 Logal process. They reset after an Air or stack restart; they are not live table
 row counts. `rejected_requests` counts only requests refused by middleware
-because the pipeline is not ready or the concurrency limit is saturated. It
+because the pipeline/store is not ready or the concurrency limit is saturated. It
 does not include receiver parsing/body-limit failures, exporter validation,
 span identity conflicts, or store admission errors.
 
@@ -344,12 +354,10 @@ At info level Logal emits:
   counters or readiness change;
 - an idle heartbeat once a minute.
 
-The activity line includes committed/deleted logs, spans, and metric points,
-middleware-rejected requests, in-flight work, readiness, database/WAL bytes,
-and free disk. Middleware rejections, not-ready state, and store errors are
-warnings. Individual incoming records are never echoed to the console. The
-collector's `Internal metrics telemetry disabled` startup message refers to
-Logal's own self-telemetry; the OTLP application metrics pipeline remains enabled.
+The activity line includes committed/deleted logs and spans, rejected requests,
+active requests, readiness, database/WAL bytes, and free disk.
+Middleware rejections, unready state, and store errors produce warnings.
+Individual records never appear in the console output.
 
 ## Querying telemetry
 
@@ -385,14 +393,13 @@ sqlite3 -readonly -column -header ../otel.debug.sqlite \
 ```
 
 Use `payload_json` when the indexed columns do not contain the field you need.
-Inspect `.schema otel_logs`, `.schema otel_spans`, and
-`.schema otel_metric_points` instead of assuming another schema version.
+Inspect `.schema otel_logs` and `.schema otel_spans` for the current schema.
 
 ## Adding or checking a telemetry producer
 
 A local producer should:
 
-1. Export OTLP/HTTP logs, traces, and metrics to `/v1/logs`, `/v1/traces`, and `/v1/metrics`.
+1. Export OTLP/HTTP logs and traces to `/v1/logs` and `/v1/traces`.
 2. Set resource `service.name` to a stable application name.
 3. Populate `request.id`, `autok.product.id`, `app.component`, and `event.name`
    when those correlation fields exist.
@@ -407,11 +414,6 @@ curl -fsS http://127.0.0.1:13133/readyz
 curl -sS http://127.0.0.1:13133/status | jq '.store, .rejected_requests'
 sqlite3 -readonly ../otel.debug.sqlite \
   "SELECT service_name, COUNT(*) FROM otel_logs GROUP BY service_name"
-
-sqlite3 -readonly ../otel.debug.sqlite \
-  "SELECT service_name, metric_name, metric_type, number_int, number_double,
-          aggregate_count, aggregate_sum
-   FROM otel_metric_points ORDER BY id DESC LIMIT 20"
 ```
 
 Allow up to 10 seconds for the aggregated activity line; committed rows should
@@ -441,13 +443,11 @@ LOGAL_TEST_HEALTH_PORT=25133 \
 The contract verifies:
 
 - readiness;
-- log, trace, and all five metric-type ingestion;
-- OTLP/gRPC ingestion for all three signals;
-- cross-protocol content deduplication;
+- log and trace ingestion over HTTP and gRPC;
+- metrics rejection over both protocols;
 - recursive sensitive-field redaction;
-- extracted correlation and metric projection columns;
-- log, span, and metric deduplication behavior;
-- full metric payload fidelity;
+- extracted correlation columns;
+- log and span deduplication;
 - graceful `SIGINT` shutdown.
 
 Air excludes `*_test.go` from reload triggers, so changing only tests does not
@@ -505,8 +505,7 @@ editing `.air.toml` or `scripts/run` itself: select Logal in the stack and press
 
 ### Metrics are not appearing
 
-Confirm `config/local.yaml` enables the metrics pipeline, the producer posts
-OTLP/HTTP to `/v1/metrics`, and `/status` reports committed metric points.
+Metrics are unsupported. Disable the producer's metrics exporter for this target.
 
 ### The disposable database needs a manual reset
 
@@ -523,8 +522,9 @@ its configured ports are active:
 The helper honors `LOGAL_DB_PATH` and all three configurable listener
 endpoints; pass the same overrides used to start Logal. It aborts if any
 database/lock file is open or any configured TCP port is listening. The
-destructive action requires `--confirm`. Never use it against a path whose
-ownership or contents matter.
+destructive action requires `--confirm` and holds the same ownership lock as startup.
+The helper uses `go run ./cmd/logal reset-db` for this operation.
+Never use it against a path whose ownership or contents matter.
 
 ## License
 

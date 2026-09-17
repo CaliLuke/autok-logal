@@ -28,17 +28,51 @@ func startTestStore(t *testing.T) *Store {
 	return s
 }
 
-func metricRecord(fingerprint byte, receivedAt int64, metricName string) MetricPointRecord {
-	value := int64(fingerprint)
-	return MetricPointRecord{
-		Fingerprint: [32]byte{fingerprint},
-		ReceivedAt:  receivedAt,
-		ServiceName: "test-service",
-		MetricName:  metricName,
-		MetricType:  "gauge",
-		NumberKind:  "int",
-		NumberInt:   &value,
-		PayloadJSON: `{}`,
+func TestStartEnablesIncrementalVacuum(t *testing.T) {
+	s := startTestStore(t)
+	var mode int
+	if err := s.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != 2 {
+		t.Fatalf("auto_vacuum=%d; pressure cleanup requires incremental mode", mode)
+	}
+}
+
+func TestStartEnablesVacuumWithoutDeletingLogs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "otel.debug.sqlite")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := createSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	// Reproduce an existing current-schema database whose free pages cannot shrink.
+	if _, err := db.Exec(`PRAGMA auto_vacuum=NONE; VACUUM`); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := [32]byte{1}
+	if _, err := db.Exec(`INSERT INTO otel_logs (fingerprint,received_at_unix_nano,service_name,body_json,payload_json) VALUES(?,?,?,?,?)`, fingerprint[:], time.Now().UnixNano(), "preserved", `{}`, `{}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s := &Store{cfg: Config{Path: path, RetentionHours: 48}, stop: make(chan struct{}), done: make(chan struct{})}
+	if err := s.Start(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Shutdown(context.Background())
+	var mode, count int
+	if err := s.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM otel_logs WHERE service_name='preserved'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if mode != 2 || count != 1 {
+		t.Fatalf("auto_vacuum=%d preserved_logs=%d; want 2 and 1", mode, count)
 	}
 }
 
@@ -172,7 +206,7 @@ func TestStartRefusesForeignSQLiteDatabase(t *testing.T) {
 	if err := check.QueryRow(`SELECT value FROM important`).Scan(&value); err != nil || value != "keep" {
 		t.Fatalf("foreign database was changed: value=%q err=%v", value, err)
 	}
-	for _, sidecar := range []string{path + "-wal", path + "-shm", path + ".lock"} {
+	for _, sidecar := range []string{path + "-wal", path + "-shm"} {
 		if _, err := os.Stat(sidecar); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("foreign sidecar retained: %s", sidecar)
 		}
@@ -380,108 +414,10 @@ func TestInsertLogsIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestInsertMetricPointsIsIdempotentAcrossRetriesAndOverlaps(t *testing.T) {
-	s := startTestStore(t)
-	now := time.Now().UnixNano()
-	first := metricRecord(10, now, "first")
-	second := metricRecord(11, now, "second")
-
-	if err := s.InsertMetricPoints(context.Background(), []MetricPointRecord{first, second}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.InsertMetricPoints(context.Background(), []MetricPointRecord{second}); err != nil {
-		t.Fatal(err)
-	}
-
-	var count int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM otel_metric_points`).Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 2 {
-		t.Fatalf("metric rows=%d", count)
-	}
-	if got := s.Snapshot(context.Background()).CommittedMetrics; got != 2 {
-		t.Fatalf("committed metric points=%d", got)
-	}
-}
-
-func TestInsertMetricPointsKeepsDistinctSameTimePoints(t *testing.T) {
-	s := startTestStore(t)
-	now := time.Now().UnixNano()
-	first := metricRecord(20, now, "same")
-	second := metricRecord(21, now, "same")
-	first.Time = 123
-	second.Time = 123
-
-	if err := s.InsertMetricPoints(context.Background(), []MetricPointRecord{first, second}); err != nil {
-		t.Fatal(err)
-	}
-	var count int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM otel_metric_points WHERE metric_name='same' AND time_unix_nano=123`).Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 2 {
-		t.Fatalf("same-time metric rows=%d", count)
-	}
-}
-
-func TestInsertMetricPointsRollsBackInvalidLaterRecord(t *testing.T) {
-	s := startTestStore(t)
-	valid := metricRecord(30, time.Now().UnixNano(), "valid")
-	invalid := metricRecord(31, time.Now().UnixNano(), "invalid")
-	invalid.PayloadJSON = `{`
-
-	if err := s.InsertMetricPoints(context.Background(), []MetricPointRecord{valid, invalid}); err == nil {
-		t.Fatal("expected invalid payload error")
-	}
-	var count int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM otel_metric_points`).Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 0 {
-		t.Fatalf("atomic request retained %d metric rows", count)
-	}
-	if got := s.Snapshot(context.Background()).CommittedMetrics; got != 0 {
-		t.Fatalf("committed metric points=%d", got)
-	}
-}
-
-func TestMaintainExpiresMetricsByReceiptTime(t *testing.T) {
-	s := startTestStore(t)
-	now := time.Now()
-	expired := metricRecord(40, now.Add(-49*time.Hour).UnixNano(), "expired")
-	expired.StartTime = 0
-	expired.Time = 0
-	current := metricRecord(41, now.UnixNano(), "current")
-	current.StartTime = now.Add(-365 * 24 * time.Hour).UnixNano()
-	current.Time = now.Add(-365 * 24 * time.Hour).UnixNano()
-
-	if err := s.InsertMetricPoints(context.Background(), []MetricPointRecord{expired, current}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Maintain(context.Background(), now); err != nil {
-		t.Fatal(err)
-	}
-	var names string
-	if err := s.db.QueryRow(`SELECT group_concat(metric_name, ',') FROM otel_metric_points`).Scan(&names); err != nil {
-		t.Fatal(err)
-	}
-	if names != "current" {
-		t.Fatalf("remaining metrics=%q", names)
-	}
-	snapshot := s.Snapshot(context.Background())
-	if snapshot.DeletedMetrics != 1 || snapshot.OldestMetric != current.ReceivedAt {
-		t.Fatalf("metric snapshot after expiration=%+v", snapshot)
-	}
-}
-
 func TestDeletePressureBatchUsesGlobalReceiptOrder(t *testing.T) {
 	s := startTestStore(t)
 	if _, err := s.db.Exec(`
-		INSERT INTO otel_metric_points
-			(fingerprint,received_at_unix_nano,service_name,metric_name,metric_type,payload_json)
-		VALUES(CAST(printf('%032d', 0) AS BLOB),1,'test','oldest','gauge','{}');
-		WITH RECURSIVE ids(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM ids WHERE value < 4999)
+		WITH RECURSIVE ids(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM ids WHERE value < 5000)
 		INSERT INTO otel_logs
 			(fingerprint,received_at_unix_nano,service_name,body_json,payload_json)
 		SELECT CAST(printf('%032d', value) AS BLOB),value+1,'test','{}','{}' FROM ids;
@@ -495,20 +431,20 @@ func TestDeletePressureBatchUsesGlobalReceiptOrder(t *testing.T) {
 	if err := s.deletePressureBatch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	var logs, spans, metrics int
-	if err := s.db.QueryRow(`SELECT (SELECT COUNT(*) FROM otel_logs),(SELECT COUNT(*) FROM otel_spans),(SELECT COUNT(*) FROM otel_metric_points)`).Scan(&logs, &spans, &metrics); err != nil {
+	var logs, spans int
+	if err := s.db.QueryRow(`SELECT (SELECT COUNT(*) FROM otel_logs),(SELECT COUNT(*) FROM otel_spans)`).Scan(&logs, &spans); err != nil {
 		t.Fatal(err)
 	}
-	if logs != 0 || spans != 1 || metrics != 0 {
-		t.Fatalf("remaining logs=%d spans=%d metrics=%d", logs, spans, metrics)
+	if logs != 0 || spans != 1 {
+		t.Fatalf("remaining logs=%d spans=%d", logs, spans)
 	}
 	snapshot := s.Snapshot(context.Background())
-	if snapshot.DeletedLogs != 4999 || snapshot.DeletedSpans != 0 || snapshot.DeletedMetrics != 1 {
+	if snapshot.DeletedLogs != 5000 || snapshot.DeletedSpans != 0 {
 		t.Fatalf("pressure deletion counters=%+v", snapshot)
 	}
 }
 
-func TestStartResetsOwnedV4DatabaseToV5(t *testing.T) {
+func TestStartResetsPreviousSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v4.sqlite")
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
@@ -533,32 +469,7 @@ func TestStartResetsOwnedV4DatabaseToV5(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='otel_metric_points'`).Scan(&metricTables); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 || metricTables != 1 {
+	if version != schemaVersion || metricTables != 0 {
 		t.Fatalf("version=%d metric_tables=%d", version, metricTables)
-	}
-}
-
-func TestMetricSchemaSignatureCoversTableAndIndexes(t *testing.T) {
-	s := startTestStore(t)
-	var objects int
-	if err := s.db.QueryRow(`
-		SELECT COUNT(*) FROM sqlite_master
-		WHERE name IN ('otel_metric_points','idx_metric_points_received','idx_metric_points_service_time','idx_metric_points_name_time')
-	`).Scan(&objects); err != nil {
-		t.Fatal(err)
-	}
-	if objects != 4 {
-		t.Fatalf("metric schema objects=%d", objects)
-	}
-	stored := ""
-	if err := s.db.QueryRow(`SELECT value FROM logal_metadata WHERE key='schema_signature'`).Scan(&stored); err != nil {
-		t.Fatal(err)
-	}
-	actual, err := calculateSchemaSignature(s.db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored != actual {
-		t.Fatalf("stored schema signature does not cover current schema")
 	}
 }

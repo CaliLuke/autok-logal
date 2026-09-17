@@ -16,6 +16,9 @@ import (
 	"go.opentelemetry.io/collector/extension/extensioncapabilities"
 	"go.opentelemetry.io/collector/extension/extensionmiddleware"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
 var Type = component.MustNewType("logal_status")
@@ -81,7 +84,7 @@ func (s *Status) Start(_ context.Context, host component.Host) error {
 	})
 	mux.HandleFunc("/readyz", s.handleReady)
 	mux.HandleFunc("/status", s.handleStatus)
-	s.server = &http.Server{Handler: mux, ReadHeaderTimeout: 2 * time.Second}
+	s.server = &http.Server{Handler: mux, ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 	s.listener, err = net.Listen("tcp", s.cfg.Endpoint)
 	if err != nil {
 		return err
@@ -103,18 +106,22 @@ func (s *Status) Start(_ context.Context, host component.Host) error {
 
 func (s *Status) Shutdown(ctx context.Context) error {
 	s.pipelineReady.Store(false)
+	var stopErr error
 	if s.reporting.CompareAndSwap(true, false) {
 		close(s.reportStop)
 		select {
 		case <-s.reportDone:
 		case <-ctx.Done():
-			return ctx.Err()
+			stopErr = ctx.Err()
 		}
 	}
 	if s.server == nil {
-		return nil
+		return stopErr
 	}
-	return s.server.Shutdown(ctx)
+	if err := s.server.Shutdown(ctx); err != nil {
+		return errors.Join(stopErr, err, s.server.Close())
+	}
+	return stopErr
 }
 
 func (s *Status) Ready() error                 { s.pipelineReady.Store(true); return nil }
@@ -124,30 +131,58 @@ func (s *Status) Dependencies() []component.ID { return []component.ID{component
 func (s *Status) GetHTTPHandler(context.Context) (extensionmiddleware.WrapHTTPHandlerFunc, error) {
 	return func(_ context.Context, next http.Handler) (http.Handler, error) {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost || (r.URL.Path != "/v1/logs" && r.URL.Path != "/v1/traces" && r.URL.Path != "/v1/metrics") {
+			if r.Method != http.MethodPost || (r.URL.Path != "/v1/logs" && r.URL.Path != "/v1/traces") {
 				next.ServeHTTP(w, r)
 				return
 			}
-			if !s.pipelineReady.Load() {
-				s.rejected.Add(1)
-				http.Error(w, "logal is not ready", http.StatusServiceUnavailable)
+			if err := s.acquire(); err != nil {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
 				return
 			}
-			select {
-			case s.permits <- struct{}{}:
-				s.inFlight.Add(1)
-				defer func() { <-s.permits; s.inFlight.Add(-1) }()
-				next.ServeHTTP(w, r)
-			default:
-				s.rejected.Add(1)
-				http.Error(w, "logal ingestion is saturated", http.StatusServiceUnavailable)
-			}
+			defer s.release()
+			next.ServeHTTP(w, r)
 		}), nil
 	}, nil
 }
 
-func (s *Status) handleReady(w http.ResponseWriter, r *http.Request) {
-	snapshot := s.store.Snapshot(r.Context())
+func (s *Status) acquire() error {
+	if !s.pipelineReady.Load() || s.store == nil || !s.store.OperationalSnapshot().Ready {
+		s.rejected.Add(1)
+		return errors.New("logal is not ready")
+	}
+	select {
+	case s.permits <- struct{}{}:
+		s.inFlight.Add(1)
+		return nil
+	default:
+		s.rejected.Add(1)
+		return errors.New("logal ingestion is saturated")
+	}
+}
+
+func (s *Status) release() {
+	<-s.permits
+	s.inFlight.Add(-1)
+}
+
+func (s *Status) GetGRPCServerOptions(context.Context) ([]grpc.ServerOption, error) {
+	return []grpc.ServerOption{grpc.ChainUnaryInterceptor(s.interceptGRPC)}, nil
+}
+
+func (s *Status) interceptGRPC(ctx context.Context, request any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	switch info.FullMethod {
+	case "/opentelemetry.proto.collector.logs.v1.LogsService/Export", "/opentelemetry.proto.collector.trace.v1.TraceService/Export":
+		if err := s.acquire(); err != nil {
+			return nil, grpcstatus.Error(codes.Unavailable, err.Error())
+		}
+		defer s.release()
+	}
+	return handler(ctx, request)
+}
+
+func (s *Status) handleReady(w http.ResponseWriter, _ *http.Request) {
+	snapshot := s.store.OperationalSnapshot()
 	if !s.pipelineReady.Load() || !snapshot.Ready || s.inFlight.Load() >= int64(s.cfg.MaxInFlight) {
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
@@ -196,10 +231,8 @@ func (s *Status) currentActivityState() activityState {
 func activityChanged(previous, current activityState) bool {
 	return previous.store.CommittedLogs != current.store.CommittedLogs ||
 		previous.store.CommittedSpans != current.store.CommittedSpans ||
-		previous.store.CommittedMetrics != current.store.CommittedMetrics ||
 		previous.store.DeletedLogs != current.store.DeletedLogs ||
 		previous.store.DeletedSpans != current.store.DeletedSpans ||
-		previous.store.DeletedMetrics != current.store.DeletedMetrics ||
 		previous.store.Ready != current.store.Ready ||
 		previous.store.LastError != current.store.LastError ||
 		previous.pipelineReady != current.pipelineReady ||
@@ -211,13 +244,10 @@ func (s *Status) logActivity(previous, current activityState) {
 		zap.Bool("ready", current.pipelineReady && current.store.Ready && current.inFlight < int64(s.cfg.MaxInFlight)),
 		zap.Uint64("logs_written", counterDelta(previous.store.CommittedLogs, current.store.CommittedLogs)),
 		zap.Uint64("spans_written", counterDelta(previous.store.CommittedSpans, current.store.CommittedSpans)),
-		zap.Uint64("metric_points_written", counterDelta(previous.store.CommittedMetrics, current.store.CommittedMetrics)),
 		zap.Uint64("logs_total", current.store.CommittedLogs),
 		zap.Uint64("spans_total", current.store.CommittedSpans),
-		zap.Uint64("metric_points_total", current.store.CommittedMetrics),
 		zap.Uint64("logs_deleted", counterDelta(previous.store.DeletedLogs, current.store.DeletedLogs)),
 		zap.Uint64("spans_deleted", counterDelta(previous.store.DeletedSpans, current.store.DeletedSpans)),
-		zap.Uint64("metric_points_deleted", counterDelta(previous.store.DeletedMetrics, current.store.DeletedMetrics)),
 		zap.Uint64("requests_rejected", counterDelta(previous.rejected, current.rejected)),
 		zap.Int64("in_flight", current.inFlight),
 		zap.Int64("database_bytes", current.store.DatabaseBytes),
@@ -251,3 +281,5 @@ func (s *Status) log() *zap.Logger {
 var _ extensioncapabilities.PipelineWatcher = (*Status)(nil)
 var _ extensioncapabilities.Dependent = (*Status)(nil)
 var _ extensionmiddleware.HTTPServer = (*Status)(nil)
+
+var _ extensionmiddleware.GRPCServer = (*Status)(nil)

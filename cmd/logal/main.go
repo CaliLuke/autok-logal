@@ -35,6 +35,7 @@ func main() {
 		ConfigProviderSettings: otelcol.ConfigProviderSettings{ResolverSettings: confmap.ResolverSettings{DefaultScheme: "file", ProviderFactories: []confmap.ProviderFactory{fileprovider.NewFactory(), envprovider.NewFactory()}}},
 	}
 	command := otelcol.NewCommand(settings)
+	command.AddCommand(newResetCommand())
 	if err := command.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

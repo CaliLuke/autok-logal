@@ -9,3 +9,5 @@ bin/
 *.sqlite-wal
 *.dylib
 *.so
+*.sqlite.lock
+*.db.lock
