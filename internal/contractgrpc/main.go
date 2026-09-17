@@ -10,13 +10,12 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 )
 
 func main() {
@@ -38,8 +37,8 @@ func main() {
 		fatal(fmt.Errorf("export traces: %w", err))
 	}
 	metricsClient := pmetricotlp.NewGRPCClient(connection)
-	if _, err := metricsClient.Export(ctx, pmetricotlp.NewExportRequest()); status.Code(err) != codes.Unimplemented {
-		fatal(fmt.Errorf("expected unsupported metrics, got: %v", err))
+	if _, err := metricsClient.Export(ctx, pmetricotlp.NewExportRequestFromMetrics(contractMetrics())); err != nil {
+		fatal(fmt.Errorf("export metrics: %w", err))
 	}
 }
 
@@ -62,6 +61,23 @@ func contractTraces() ptrace.Traces {
 	span.SetSpanID(pcommon.SpanID{5, 6, 7, 8})
 	span.SetName("grpc span")
 	return traces
+}
+
+func contractMetrics() pmetric.Metrics {
+	metrics := pmetric.NewMetrics()
+	resource := metrics.ResourceMetrics().AppendEmpty()
+	resource.Resource().Attributes().PutStr("service.name", "grpc-contract")
+	scope := resource.ScopeMetrics().AppendEmpty()
+	metric := scope.Metrics().AppendEmpty()
+	metric.SetName("grpc.contract.gauge")
+	metric.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)
+
+	crossResource := metrics.ResourceMetrics().AppendEmpty()
+	crossResource.Resource().Attributes().PutStr("service.name", "contract-cross")
+	crossMetric := crossResource.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	crossMetric.SetName("contract.cross.gauge")
+	crossMetric.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)
+	return metrics
 }
 
 func fatal(err error) {

@@ -55,7 +55,7 @@ func (s *Store) Maintain(ctx context.Context, now time.Time) error {
 	for _, signal := range []struct {
 		table   string
 		deleted *atomic.Uint64
-	}{{"otel_logs", &s.deletedLogs}, {"otel_spans", &s.deletedSpans}} {
+	}{{"otel_logs", &s.deletedLogs}, {"otel_spans", &s.deletedSpans}, {"otel_metric_points", &s.deletedMetrics}} {
 		result, err := s.db.ExecContext(ctx, `DELETE FROM `+signal.table+` WHERE id IN (SELECT id FROM `+signal.table+` WHERE received_at_unix_nano < ? ORDER BY received_at_unix_nano LIMIT 5000)`, cutoff)
 		if err != nil {
 			return err
@@ -92,11 +92,11 @@ func (s *Store) Maintain(ctx context.Context, now time.Time) error {
 			return err
 		}
 		if freePages == 0 {
-			before := s.deletedLogs.Load() + s.deletedSpans.Load()
+			before := s.deletedLogs.Load() + s.deletedSpans.Load() + s.deletedMetrics.Load()
 			if err := s.deletePressureBatch(ctx); err != nil {
 				return err
 			}
-			if s.deletedLogs.Load()+s.deletedSpans.Load() == before {
+			if s.deletedLogs.Load()+s.deletedSpans.Load()+s.deletedMetrics.Load() == before {
 				return errors.New("disk pressure persists with no telemetry left to evict")
 			}
 		}
@@ -137,11 +137,13 @@ func (s *Store) deletePressureBatch(ctx context.Context) error {
 			SELECT 0 AS signal, id, received_at_unix_nano FROM otel_logs
 			UNION ALL
 			SELECT 1 AS signal, id, received_at_unix_nano FROM otel_spans
+			UNION ALL
+			SELECT 2 AS signal, id, received_at_unix_nano FROM otel_metric_points
 		) ORDER BY received_at_unix_nano, signal, id LIMIT 5000`)
 	if err != nil {
 		return err
 	}
-	var logIDs, spanIDs []int64
+	var logIDs, spanIDs, metricIDs []int64
 	for rows.Next() {
 		var signal int
 		var id int64
@@ -154,6 +156,8 @@ func (s *Store) deletePressureBatch(ctx context.Context) error {
 			logIDs = append(logIDs, id)
 		case 1:
 			spanIDs = append(spanIDs, id)
+		case 2:
+			metricIDs = append(metricIDs, id)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -163,7 +167,7 @@ func (s *Store) deletePressureBatch(ctx context.Context) error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	if len(logIDs)+len(spanIDs) == 0 {
+	if len(logIDs)+len(spanIDs)+len(metricIDs) == 0 {
 		return nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -181,11 +185,17 @@ func (s *Store) deletePressureBatch(ctx context.Context) error {
 			return err
 		}
 	}
+	for _, id := range metricIDs {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM otel_metric_points WHERE id=?`, id); err != nil {
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	s.deletedLogs.Add(uint64(len(logIDs)))
 	s.deletedSpans.Add(uint64(len(spanIDs)))
+	s.deletedMetrics.Add(uint64(len(metricIDs)))
 	return nil
 }
 
@@ -194,6 +204,7 @@ func (s *Store) Snapshot(ctx context.Context) Snapshot {
 	defer s.mu.Unlock()
 	snapshot := s.OperationalSnapshot()
 	if s.db != nil {
+		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_metric_points`).Scan(&snapshot.OldestMetric)
 		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_logs`).Scan(&snapshot.OldestLog)
 		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_spans`).Scan(&snapshot.OldestSpan)
 	}
@@ -203,7 +214,7 @@ func (s *Store) Snapshot(ctx context.Context) Snapshot {
 // OperationalSnapshot returns the counters and capacity state without waiting
 // for the SQLite writer. It is intended for periodic health reporting.
 func (s *Store) OperationalSnapshot() Snapshot {
-	snapshot := Snapshot{Ready: s.ready.Load(), CommittedLogs: s.committedLogs.Load(), CommittedSpans: s.committedSpans.Load(), DeletedLogs: s.deletedLogs.Load(), DeletedSpans: s.deletedSpans.Load()}
+	snapshot := Snapshot{CommittedMetrics: s.committedMetrics.Load(), DeletedMetrics: s.deletedMetrics.Load(), Ready: s.ready.Load(), CommittedLogs: s.committedLogs.Load(), CommittedSpans: s.committedSpans.Load(), DeletedLogs: s.deletedLogs.Load(), DeletedSpans: s.deletedSpans.Load()}
 	snapshot.DatabaseBytes, snapshot.ActiveBytes, snapshot.FreeBytes, snapshot.WALBytes = diskState(s.cfg.Path)
 	if lastError := s.lastError.Load(); lastError != nil {
 		snapshot.LastError = *lastError

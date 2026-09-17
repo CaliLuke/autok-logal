@@ -11,7 +11,6 @@ import (
 
 	"github.com/CaliLuke/autok-logal/internal/store"
 	"go.opentelemetry.io/collector/component"
-	collexporter "go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/extension"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -39,13 +38,6 @@ func startExporterStore(t *testing.T) (*store.Store, string) {
 		}
 	})
 	return s, cfg.Path
-}
-
-func TestFactoryRejectsMetrics(t *testing.T) {
-	f := NewFactory()
-	if _, err := f.CreateMetrics(context.Background(), collexporter.Settings{ID: component.NewID(Type)}, f.CreateDefaultConfig()); err == nil {
-		t.Fatal("metrics unexpectedly supported")
-	}
 }
 
 func TestLogFingerprintCanonicalizesMapsWithoutMutatingInput(t *testing.T) {

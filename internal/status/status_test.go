@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,13 +163,15 @@ func TestReadyzIncludesPipelineAndStoreReadiness(t *testing.T) {
 func TestActivityChangedTracksOperationalSignals(t *testing.T) {
 	baseline := activityState{store: store.Snapshot{Ready: true}, pipelineReady: true}
 	tests := map[string]activityState{
-		"logs":            {store: store.Snapshot{Ready: true, CommittedLogs: 1}, pipelineReady: true},
-		"spans":           {store: store.Snapshot{Ready: true, CommittedSpans: 1}, pipelineReady: true},
-		"retention":       {store: store.Snapshot{Ready: true, DeletedLogs: 1}, pipelineReady: true},
-		"store readiness": {store: store.Snapshot{Ready: false}, pipelineReady: true},
-		"pipeline":        {store: store.Snapshot{Ready: true}, pipelineReady: false},
-		"error":           {store: store.Snapshot{Ready: true, LastError: "disk full"}, pipelineReady: true},
-		"rejection":       {store: store.Snapshot{Ready: true}, pipelineReady: true, rejected: 1},
+		"metrics":          {store: store.Snapshot{Ready: true, CommittedMetrics: 1}, pipelineReady: true},
+		"metric retention": {store: store.Snapshot{Ready: true, DeletedMetrics: 1}, pipelineReady: true},
+		"logs":             {store: store.Snapshot{Ready: true, CommittedLogs: 1}, pipelineReady: true},
+		"spans":            {store: store.Snapshot{Ready: true, CommittedSpans: 1}, pipelineReady: true},
+		"retention":        {store: store.Snapshot{Ready: true, DeletedLogs: 1}, pipelineReady: true},
+		"store readiness":  {store: store.Snapshot{Ready: false}, pipelineReady: true},
+		"pipeline":         {store: store.Snapshot{Ready: true}, pipelineReady: false},
+		"error":            {store: store.Snapshot{Ready: true, LastError: "disk full"}, pipelineReady: true},
+		"rejection":        {store: store.Snapshot{Ready: true}, pipelineReady: true, rejected: 1},
 	}
 	for name, current := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -211,5 +214,81 @@ func TestGRPCAndHTTPShareAdmissionAndReleaseOnError(t *testing.T) {
 	_, err = s.interceptGRPC(context.Background(), nil, info, func(context.Context, any) (any, error) { t.Fatal("unready handler called"); return nil, nil })
 	if grpcstatus.Code(err) != codes.Unavailable {
 		t.Fatalf("unready error=%v", err)
+	}
+}
+
+func TestStatusReturnsMetricCounters(t *testing.T) {
+	sqliteStore := newStatusStore(t)
+	t.Cleanup(func() {
+		if err := sqliteStore.Shutdown(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	record := store.MetricPointRecord{
+		Fingerprint: [32]byte{1}, ReceivedAt: time.Now().UnixNano(), ServiceName: "status-test",
+		MetricName: "status.metric", MetricType: "gauge", PayloadJSON: `{}`,
+	}
+	if err := sqliteStore.InsertMetricPoints(context.Background(), []store.MetricPointRecord{record}); err != nil {
+		t.Fatal(err)
+	}
+	statusExtension := &Status{cfg: Config{MaxInFlight: 1}, permits: make(chan struct{}, 1), store: sqliteStore}
+	statusExtension.pipelineReady.Store(true)
+
+	response := httptest.NewRecorder()
+	statusExtension.handleStatus(response, httptest.NewRequest(http.MethodGet, "/status", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status code=%d", response.Code)
+	}
+	if body := response.Body.String(); !strings.Contains(body, `"committed_metric_points":1`) || !strings.Contains(body, `"oldest_metric_received_unix_nano":`) {
+		t.Fatalf("status body=%s", body)
+	}
+}
+
+func TestAllSignalsShareHTTPAndGRPCAdmission(t *testing.T) {
+	s := &Status{cfg: Config{MaxInFlight: 1}, permits: make(chan struct{}, 1), store: newStatusStore(t)}
+	s.pipelineReady.Store(true)
+	methods := []string{
+		"/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+		"/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+		"/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+	}
+	paths := []string{"/v1/logs", "/v1/traces", "/v1/metrics"}
+	rejectingHTTP := wrapIngestion(t, s, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("HTTP bypassed occupied gRPC permit") }))
+	for _, method := range methods {
+		_, err := s.interceptGRPC(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
+			for _, path := range paths {
+				response := httptest.NewRecorder()
+				rejectingHTTP.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+				if response.Code != http.StatusServiceUnavailable {
+					t.Fatalf("%s bypassed %s: %d", path, method, response.Code)
+				}
+			}
+			return nil, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	blockingHTTP := wrapIngestion(t, s, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for _, method := range methods {
+			_, err := s.interceptGRPC(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
+				t.Fatal("gRPC bypassed occupied HTTP permit")
+				return nil, nil
+			})
+			if grpcstatus.Code(err) != codes.Unavailable {
+				t.Fatalf("%s admission error=%v", method, err)
+			}
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	for _, path := range paths {
+		response := httptest.NewRecorder()
+		blockingHTTP.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("%s status=%d", path, response.Code)
+		}
+	}
+	if s.inFlight.Load() != 0 || len(s.permits) != 0 {
+		t.Fatal("shared permit leaked")
 	}
 }

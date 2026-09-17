@@ -131,7 +131,7 @@ func (s *Status) Dependencies() []component.ID { return []component.ID{component
 func (s *Status) GetHTTPHandler(context.Context) (extensionmiddleware.WrapHTTPHandlerFunc, error) {
 	return func(_ context.Context, next http.Handler) (http.Handler, error) {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost || (r.URL.Path != "/v1/logs" && r.URL.Path != "/v1/traces") {
+			if r.Method != http.MethodPost || (r.URL.Path != "/v1/logs" && r.URL.Path != "/v1/traces" && r.URL.Path != "/v1/metrics") {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -172,7 +172,7 @@ func (s *Status) GetGRPCServerOptions(context.Context) ([]grpc.ServerOption, err
 
 func (s *Status) interceptGRPC(ctx context.Context, request any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	switch info.FullMethod {
-	case "/opentelemetry.proto.collector.logs.v1.LogsService/Export", "/opentelemetry.proto.collector.trace.v1.TraceService/Export":
+	case "/opentelemetry.proto.collector.logs.v1.LogsService/Export", "/opentelemetry.proto.collector.trace.v1.TraceService/Export", "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export":
 		if err := s.acquire(); err != nil {
 			return nil, grpcstatus.Error(codes.Unavailable, err.Error())
 		}
@@ -229,7 +229,9 @@ func (s *Status) currentActivityState() activityState {
 }
 
 func activityChanged(previous, current activityState) bool {
-	return previous.store.CommittedLogs != current.store.CommittedLogs ||
+	return previous.store.CommittedMetrics != current.store.CommittedMetrics ||
+		previous.store.DeletedMetrics != current.store.DeletedMetrics ||
+		previous.store.CommittedLogs != current.store.CommittedLogs ||
 		previous.store.CommittedSpans != current.store.CommittedSpans ||
 		previous.store.DeletedLogs != current.store.DeletedLogs ||
 		previous.store.DeletedSpans != current.store.DeletedSpans ||
@@ -241,6 +243,9 @@ func activityChanged(previous, current activityState) bool {
 
 func (s *Status) logActivity(previous, current activityState) {
 	fields := []zap.Field{
+		zap.Uint64("metric_points_written", counterDelta(previous.store.CommittedMetrics, current.store.CommittedMetrics)),
+		zap.Uint64("metric_points_total", current.store.CommittedMetrics),
+		zap.Uint64("metric_points_deleted", counterDelta(previous.store.DeletedMetrics, current.store.DeletedMetrics)),
 		zap.Bool("ready", current.pipelineReady && current.store.Ready && current.inFlight < int64(s.cfg.MaxInFlight)),
 		zap.Uint64("logs_written", counterDelta(previous.store.CommittedLogs, current.store.CommittedLogs)),
 		zap.Uint64("spans_written", counterDelta(previous.store.CommittedSpans, current.store.CommittedSpans)),

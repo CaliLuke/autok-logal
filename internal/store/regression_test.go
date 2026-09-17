@@ -237,3 +237,22 @@ func TestResetSharesWriterOwnership(t *testing.T) {
 		t.Fatalf("stable lock removed: %v", err)
 	}
 }
+
+func TestOwnershipRejectsOpenSidecarWithoutOpenDatabase(t *testing.T) {
+	for _, suffix := range []string{"-wal", "-shm"} {
+		t.Run(suffix, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "telemetry.sqlite")
+			if err := os.WriteFile(path, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			sidecar, err := os.OpenFile(path+suffix, os.O_CREATE|os.O_RDWR, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sidecar.Close()
+			if err := rejectOpenDescriptors(path); err == nil {
+				t.Fatalf("open %s sidecar was not detected", suffix)
+			}
+		})
+	}
+}

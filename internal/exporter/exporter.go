@@ -49,6 +49,9 @@ func NewFactory() collexporter.Factory {
 		collexporter.WithTraces(func(_ context.Context, _ collexporter.Settings, cfg component.Config) (collexporter.Traces, error) {
 			return &tracesExporter{cfg: *cfg.(*Config)}, nil
 		}, component.StabilityLevelAlpha),
+		collexporter.WithMetrics(func(_ context.Context, _ collexporter.Settings, cfg component.Config) (collexporter.Metrics, error) {
+			return &metricsExporter{cfg: *cfg.(*Config)}, nil
+		}, component.StabilityLevelAlpha),
 	)
 }
 
@@ -366,7 +369,7 @@ func canonicalize(value any, parent string) {
 	switch value := value.(type) {
 	case map[string]any:
 		for key, child := range value {
-			if key == "attributes" || (parent == "kvlistValue" && key == "values") {
+			if key == "attributes" || key == "filteredAttributes" || key == "metadata" || (parent == "kvlistValue" && key == "values") {
 				if entries, ok := child.([]any); ok {
 					sort.SliceStable(entries, func(i, j int) bool {
 						left, _ := entries[i].(map[string]any)["key"].(string)

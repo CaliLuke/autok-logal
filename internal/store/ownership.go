@@ -58,6 +58,7 @@ func (s *Store) acquireOwnership() error {
 }
 
 func rejectOpenDescriptors(path string) error {
+	candidates := make([]string, 0, 3)
 	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
 		if _, err := os.Stat(candidate); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -65,16 +66,23 @@ func rejectOpenDescriptors(path string) error {
 			}
 			return err
 		}
-		inspectionCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		output, err := exec.CommandContext(inspectionCtx, "lsof", "-t", "--", candidate).Output()
-		cancel()
-		if err == nil && len(output) > 0 {
-			return fmt.Errorf("refuse telemetry database already open by another process: %s", candidate)
-		}
-		var exitErr *exec.ExitError
-		if err != nil && (!errors.As(err, &exitErr) || exitErr.ExitCode() != 1) {
-			return fmt.Errorf("inspect open descriptors for %s: %w", candidate, err)
-		}
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	// One scan checks all database files. Avoid DNS/service lookups and repeated
+	// process-table scans, which can exceed the startup deadline on busy hosts.
+	inspectionCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	args := append([]string{"-nP", "-t", "--"}, candidates...)
+	output, err := exec.CommandContext(inspectionCtx, "lsof", args...).Output()
+	if len(output) > 0 {
+		return fmt.Errorf("refuse telemetry database already open by another process: %s", path)
+	}
+	var exitErr *exec.ExitError
+	if err != nil && (!errors.As(err, &exitErr) || exitErr.ExitCode() != 1) {
+		return fmt.Errorf("inspect open descriptors for %s: %w", path, err)
 	}
 	return nil
 }

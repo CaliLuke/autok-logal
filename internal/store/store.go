@@ -57,21 +57,26 @@ type SpanRecord struct {
 }
 
 type Snapshot struct {
-	Ready          bool   `json:"ready"`
-	DatabaseBytes  int64  `json:"database_bytes"`
-	WALBytes       int64  `json:"wal_bytes"`
-	OldestLog      int64  `json:"oldest_log_received_unix_nano"`
-	OldestSpan     int64  `json:"oldest_span_received_unix_nano"`
-	CommittedLogs  uint64 `json:"committed_logs"`
-	CommittedSpans uint64 `json:"committed_spans"`
-	DeletedLogs    uint64 `json:"deleted_logs"`
-	DeletedSpans   uint64 `json:"deleted_spans"`
-	ActiveBytes    int64  `json:"active_bytes"`
-	FreeBytes      uint64 `json:"free_bytes"`
-	LastError      string `json:"last_error,omitempty"`
+	OldestMetric     int64  `json:"oldest_metric_received_unix_nano"`
+	CommittedMetrics uint64 `json:"committed_metric_points"`
+	DeletedMetrics   uint64 `json:"deleted_metric_points"`
+	Ready            bool   `json:"ready"`
+	DatabaseBytes    int64  `json:"database_bytes"`
+	WALBytes         int64  `json:"wal_bytes"`
+	OldestLog        int64  `json:"oldest_log_received_unix_nano"`
+	OldestSpan       int64  `json:"oldest_span_received_unix_nano"`
+	CommittedLogs    uint64 `json:"committed_logs"`
+	CommittedSpans   uint64 `json:"committed_spans"`
+	DeletedLogs      uint64 `json:"deleted_logs"`
+	DeletedSpans     uint64 `json:"deleted_spans"`
+	ActiveBytes      int64  `json:"active_bytes"`
+	FreeBytes        uint64 `json:"free_bytes"`
+	LastError        string `json:"last_error,omitempty"`
 }
 
 type Store struct {
+	committedMetrics  atomic.Uint64
+	deletedMetrics    atomic.Uint64
 	cfg               Config
 	db                *sql.DB
 	mu                sync.Mutex

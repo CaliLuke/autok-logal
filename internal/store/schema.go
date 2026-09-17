@@ -19,7 +19,7 @@ import (
 
 const (
 	applicationID = 0x4c4f474c
-	schemaVersion = 6
+	schemaVersion = 7
 )
 
 func (s *Store) openCurrentSchema() error {
@@ -276,9 +276,10 @@ func inspectSchema(db *sql.DB) (current bool, disposable bool, err error) {
 
 func schemaHasRequiredColumns(db *sql.DB) (bool, error) {
 	required := map[string][]string{
-		"otel_logs":      {"fingerprint", "received_at_unix_nano", "service_name", "severity_text", "body_json", "payload_json"},
-		"otel_spans":     {"fingerprint", "received_at_unix_nano", "trace_id", "span_id", "service_name", "name", "payload_json"},
-		"logal_metadata": {"key", "value"},
+		"otel_metric_points": {"fingerprint", "received_at_unix_nano", "service_name", "metric_name", "metric_type", "payload_json"},
+		"otel_logs":          {"fingerprint", "received_at_unix_nano", "service_name", "severity_text", "body_json", "payload_json"},
+		"otel_spans":         {"fingerprint", "received_at_unix_nano", "trace_id", "span_id", "service_name", "name", "payload_json"},
+		"logal_metadata":     {"key", "value"},
 	}
 	for table, columns := range required {
 		var count int
@@ -355,6 +356,24 @@ func createSchema(db *sql.DB) error {
 			payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
 			UNIQUE(trace_id, span_id)
 		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS otel_metric_points (
+			id INTEGER PRIMARY KEY,
+			fingerprint BLOB NOT NULL UNIQUE CHECK(length(fingerprint) = 32),
+			received_at_unix_nano INTEGER NOT NULL,
+			service_name TEXT NOT NULL,
+			metric_name TEXT NOT NULL,
+			metric_type TEXT NOT NULL CHECK(metric_type IN ('gauge','sum','histogram','exponential_histogram','summary')),
+			start_time_unix_nano INTEGER NOT NULL DEFAULT 0,
+			time_unix_nano INTEGER NOT NULL DEFAULT 0,
+			number_kind TEXT CHECK(number_kind IS NULL OR number_kind IN ('int','double')),
+			number_int INTEGER,
+			number_double REAL,
+			aggregate_count TEXT,
+			aggregate_sum REAL,
+			aggregate_min REAL,
+			aggregate_max REAL,
+			payload_json TEXT NOT NULL CHECK(json_valid(payload_json))
+		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_received ON otel_logs(received_at_unix_nano)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_trace ON otel_logs(trace_id, span_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_service_time ON otel_logs(service_name, time_unix_nano)`,
@@ -363,6 +382,9 @@ func createSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_logs_component ON otel_logs(component, time_unix_nano)`,
 		`CREATE INDEX IF NOT EXISTS idx_spans_received ON otel_spans(received_at_unix_nano)`,
 		`CREATE INDEX IF NOT EXISTS idx_spans_service_start ON otel_spans(service_name, start_time_unix_nano)`,
+		`CREATE INDEX IF NOT EXISTS idx_metric_points_received ON otel_metric_points(received_at_unix_nano)`,
+		`CREATE INDEX IF NOT EXISTS idx_metric_points_service_time ON otel_metric_points(service_name, time_unix_nano)`,
+		`CREATE INDEX IF NOT EXISTS idx_metric_points_name_time ON otel_metric_points(metric_name, time_unix_nano)`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {

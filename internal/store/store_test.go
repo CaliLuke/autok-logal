@@ -417,7 +417,10 @@ func TestInsertLogsIsIdempotent(t *testing.T) {
 func TestDeletePressureBatchUsesGlobalReceiptOrder(t *testing.T) {
 	s := startTestStore(t)
 	if _, err := s.db.Exec(`
-		WITH RECURSIVE ids(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM ids WHERE value < 5000)
+		INSERT INTO otel_metric_points
+			(fingerprint,received_at_unix_nano,service_name,metric_name,metric_type,payload_json)
+		VALUES(CAST(printf('%032d', 0) AS BLOB),1,'test','oldest','gauge','{}');
+		WITH RECURSIVE ids(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM ids WHERE value < 4999)
 		INSERT INTO otel_logs
 			(fingerprint,received_at_unix_nano,service_name,body_json,payload_json)
 		SELECT CAST(printf('%032d', value) AS BLOB),value+1,'test','{}','{}' FROM ids;
@@ -431,15 +434,15 @@ func TestDeletePressureBatchUsesGlobalReceiptOrder(t *testing.T) {
 	if err := s.deletePressureBatch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	var logs, spans int
-	if err := s.db.QueryRow(`SELECT (SELECT COUNT(*) FROM otel_logs),(SELECT COUNT(*) FROM otel_spans)`).Scan(&logs, &spans); err != nil {
+	var logs, spans, metrics int
+	if err := s.db.QueryRow(`SELECT (SELECT COUNT(*) FROM otel_logs),(SELECT COUNT(*) FROM otel_spans),(SELECT COUNT(*) FROM otel_metric_points)`).Scan(&logs, &spans, &metrics); err != nil {
 		t.Fatal(err)
 	}
-	if logs != 0 || spans != 1 {
-		t.Fatalf("remaining logs=%d spans=%d", logs, spans)
+	if logs != 0 || spans != 1 || metrics != 0 {
+		t.Fatalf("remaining logs=%d spans=%d metrics=%d", logs, spans, metrics)
 	}
 	snapshot := s.Snapshot(context.Background())
-	if snapshot.DeletedLogs != 5000 || snapshot.DeletedSpans != 0 {
+	if snapshot.DeletedLogs != 4999 || snapshot.DeletedSpans != 0 || snapshot.DeletedMetrics != 1 {
 		t.Fatalf("pressure deletion counters=%+v", snapshot)
 	}
 }
@@ -450,7 +453,7 @@ func TestStartResetsPreviousSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(fmt.Sprintf(`PRAGMA application_id=%d; PRAGMA user_version=4; CREATE TABLE otel_logs(marker TEXT); INSERT INTO otel_logs VALUES('v4')`, applicationID)); err != nil {
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA application_id=%d; PRAGMA user_version=6; CREATE TABLE otel_logs(marker TEXT); INSERT INTO otel_logs VALUES('v4')`, applicationID)); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -469,7 +472,7 @@ func TestStartResetsPreviousSchema(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='otel_metric_points'`).Scan(&metricTables); err != nil {
 		t.Fatal(err)
 	}
-	if version != schemaVersion || metricTables != 0 {
+	if version != schemaVersion || metricTables != 1 {
 		t.Fatalf("version=%d metric_tables=%d", version, metricTables)
 	}
 }
