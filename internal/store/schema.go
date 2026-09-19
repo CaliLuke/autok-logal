@@ -235,16 +235,16 @@ func inspectSchema(db *sql.DB) (current bool, disposable bool, err error) {
 	}
 	if appID == 0 && version == 0 {
 		var tables, telemetryTables int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`).Scan(&tables); err != nil {
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'`).Scan(&tables); err != nil {
 			return false, false, err
 		}
 		if tables == 0 {
 			return true, false, nil
 		}
-		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('otel_logs','otel_spans')`).Scan(&telemetryTables); err != nil {
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('otel_logs','otel_spans','otel_metric_points','logal_metadata')`).Scan(&telemetryTables); err != nil {
 			return false, false, err
 		}
-		return false, telemetryTables > 0, nil
+		return false, telemetryTables > 0 && telemetryTables == tables, nil
 	}
 	if appID != applicationID {
 		return false, false, nil
@@ -301,7 +301,7 @@ func schemaHasRequiredColumns(db *sql.DB) (bool, error) {
 }
 
 func calculateSchemaSignature(db *sql.DB) (string, error) {
-	rows, err := db.Query(`SELECT type, name, COALESCE(sql,'') FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`)
+	rows, err := db.Query(`SELECT type, name, COALESCE(sql,'') FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name`)
 	if err != nil {
 		return "", err
 	}

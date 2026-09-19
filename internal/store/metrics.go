@@ -25,12 +25,15 @@ type MetricPointRecord struct {
 	PayloadJSON    string
 }
 
-func (s *Store) InsertMetricPoints(ctx context.Context, records []MetricPointRecord) error {
+func (s *Store) InsertMetricPoints(ctx context.Context, records []MetricPointRecord) (err error) {
 	if !s.ready.Load() {
 		return errors.New("store is not ready")
 	}
-	s.mu.Lock()
+	if err := s.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer s.mu.Unlock()
+	defer func() { s.recordWriteError(err) }()
 	if err := s.admissionErrorLocked(); err != nil {
 		return err
 	}

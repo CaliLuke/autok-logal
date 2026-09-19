@@ -3,6 +3,7 @@ extensions:
     path: ${env:LOGAL_DB_PATH}
     retention_hours: ${env:LOGAL_RETENTION_HOURS}
   logal_status:
+    store: logal_store
     endpoint: ${env:LOGAL_HEALTH_ENDPOINT}
     max_in_flight_requests: ${env:LOGAL_MAX_IN_FLIGHT_REQUESTS}
 

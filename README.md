@@ -80,7 +80,9 @@ are:
 | `internal/store` | Owns SQLite, verifies schema ownership, serializes writes, deduplicates records, enforces capacity, and performs retention. |
 | `internal/status` | Exposes health/status endpoints, limits concurrent requests, counts rejections, and emits operational summaries. |
 | `scripts/run` | Applies defaults and launches Air, or runs a direct one-shot binary when watching is disabled. |
-| `scripts/contract-test` | Starts a temporary Logal and verifies all three signals, fidelity, redaction, and deduplication. |
+| `cmd/logal/*_test.go` | Runs the real collector against temporary databases to check protocol handling, persistence, and recovery. |
+| `scripts/verify` | Runs static checks, race-enabled tests, a build, and the runner configuration check. |
+| `scripts/contract-test` | Runs only the collector contract tests with detailed output. |
 | `scripts/reset-db` | Refuses active files/ports and requires explicit confirmation before deleting the disposable database. |
 
 ## Scope and invariants
@@ -92,7 +94,7 @@ Keep these constraints intact when changing Logal:
   must never point at a pre-existing file whose contents matter.
 - Logal attempts to recognize and refuse foreign SQLite databases, but that
   check is defense in depth rather than permission to use an untrusted path.
-- Symlinked, non-regular, or already-open database files are refused.
+- Logal refuses symlinked, hard-linked, non-regular, or already-open database files.
 - Logs, traces, and metrics share one database, retention policy, and pressure
   policy.
 - The collector binds to loopback and is intended only for local development.
@@ -119,7 +121,8 @@ database.
 - A C toolchain for `github.com/mattn/go-sqlite3` and CGO. On macOS, install
   Xcode Command Line Tools if compilation cannot find a compiler.
 - `lsof`, used to prevent unsafe database reuse or replacement.
-- `sqlite3` and `curl`; the contract test requires both.
+- `sqlite3` and `curl` are optional tools for manual database and endpoint inspection.
+  The automated contract tests use Go clients and SQLite directly.
 - `jq` is optional but useful for `/status`.
 - Air for automatic development rebuilds.
 
@@ -245,9 +248,8 @@ On startup, the store performs this sequence before reporting ready:
 3. Inspect the SQLite application ID, schema version, required columns, stored
    schema signature, and `PRAGMA quick_check` result.
 4. Recreate an absent, stale, corrupt, non-SQLite, or recognized legacy Logal
-   database. This can include an untagged database containing `otel_logs` or
-   `otel_spans`. Recognizable unrelated SQLite databases are refused, but the
-   configured path must always be treated as destructive.
+   database. An untagged database qualifies only when all its tables have recognized Logal names.
+   Logal refuses untagged databases with unrelated tables. The configured path remains destructive.
 5. Open SQLite in WAL mode with full synchronous writes and one connection.
 6. Execute and roll back a write probe.
 7. Start maintenance, health/status reporting, the OTLP receiver, and finally
@@ -304,6 +306,7 @@ time, trace/span identity, and service/start time. Span `request_id` and
 Logal replaces recognized sensitive fields with `[REDACTED]` before persistence.
 The matcher recognizes `authorization`, `cookie`, `set_cookie`, `password`,
 `passwd`, `secret`, `api_key`, and named credential tokens such as `access_token`.
+It also recognizes `apiKey`, `accessToken`, `clientSecret`, `proxy-authorization`, and prefixed names such as `db_password`.
 It also checks nested maps, log bodies, span events, span links, metric metadata,
 and exemplar attributes.
 Numeric token counts such as `gen_ai.usage.input_tokens` remain intact.
@@ -312,8 +315,9 @@ from those messages.
 
 ### Retention and capacity protection
 
-Maintenance runs every 30 seconds. It deletes expired logs, spans, and metric points in bounded
-batches, performs incremental vacuuming, and checkpoints the WAL. Each maintenance
+Maintenance runs every 30 seconds. It deletes expired records in batches of 5,000 per signal.
+It repeats across all three signals until the backlog is empty or the deadline expires.
+Then it performs incremental vacuuming and checkpoints the WAL. Each maintenance
 cycle has a five-second deadline. A blocked checkpoint stops pressure eviction
 until a later cycle. Logal reclaims existing free pages before it deletes fresh records.
 SQLite reports blocked checkpoints through [result rows](https://www.sqlite.org/pragma.html#pragma_wal_checkpoint).
@@ -329,6 +333,8 @@ guardrails are:
 If capacity cannot safely admit another transaction, ingestion returns an
 unavailable response rather than risking the machine or database. `/readyz`
 also becomes unhealthy when those readiness limits are crossed.
+SQLite storage failures stop admission and appear in `last_error`.
+Successful maintenance restores readiness. Invalid records and canceled requests do not mark the store unhealthy.
 
 ## Health and operational logging
 
@@ -337,6 +343,14 @@ also becomes unhealthy when those readiness limits are crossed.
 | `/livez` | The status HTTP server is alive. It does not prove ingestion is safe. |
 | `/readyz` | Pipelines and store are ready, disk/WAL limits are safe, and the request concurrency limit is not saturated. |
 | `/status` | JSON details for pipeline readiness, in-flight/limit/middleware-rejected requests, store counters, sizes, oldest records, free disk, and the latest operational error. |
+
+The status extension uses its `store` configuration field to select the store extension.
+The default is `logal_store`. Unexpected status-server failure stops the collector.
+
+The `/status` endpoint waits at most one second for database details.
+If the writer remains busy, the response contains operational counters and `snapshot_error`.
+The oldest-record fields are incomplete in that response.
+Canceled exports also stop their wait for the writer.
 
 Inspect an unhealthy instance with:
 
@@ -438,17 +452,36 @@ be queryable immediately after the OTLP request succeeds.
 
 ## Validation workflow
 
-Before considering changes complete:
+Run the complete verification suite:
 
 ```bash
-go test ./...
-go build -o /tmp/autok-logal ./cmd/logal
-./scripts/run --dry-run
+./scripts/verify
+```
+
+This command runs `go vet`, uncached tests with the race detector, a build, and the standalone runner configuration check.
+The collector subprocess also uses the race detector.
+The runner check uses direct mode, so verification does not require Air.
+GitHub Actions runs the same command on Linux and macOS.
+
+The contract tests are part of `go test ./...`.
+They build the real collector and use temporary databases and automatically selected loopback ports.
+They retry startup after an automatic port collision and print collector logs on failure.
+The tests require Go, a C toolchain, and `lsof`.
+They do not require `curl` or the `sqlite3` command.
+
+Run only the contract tests with detailed output:
+
+```bash
 ./scripts/contract-test
 ```
 
-The contract test uses a temporary database and fixed non-stack ports
-`24317`/`24318`/`23133`. Override any listener independently:
+To skip collector subprocess tests:
+
+```bash
+go test -short ./...
+```
+
+To inspect a specific listener, override its test port:
 
 ```bash
 LOGAL_TEST_OTLP_GRPC_PORT=25317 \
@@ -457,17 +490,20 @@ LOGAL_TEST_HEALTH_PORT=25133 \
 ./scripts/contract-test
 ```
 
-The contract verifies:
+Explicit ports must be available. Separate test runs can overlap with automatic ports.
+The contract suite checks:
 
-- readiness;
-- log, trace, and all five metric-type ingestion;
-- OTLP/gRPC ingestion for all three signals;
-- cross-protocol metric deduplication;
-- recursive sensitive-field redaction;
-- extracted correlation and metric projection columns;
-- log, span, and metric deduplication;
-- metric payload fidelity and exemplar correlation;
-- graceful `SIGINT` shutdown.
+- readiness, simultaneous collector isolation, and graceful shutdown;
+- HTTP and gRPC ingestion for all three signals;
+- all five metric types, payload fidelity, and exemplar correlation;
+- redaction, correlation fields, and retry deduplication;
+- malformed JSON/protobuf, unsupported content types, and request size limits;
+- invalid batches and span conflicts, with no partial persistence;
+- abrupt process termination, WAL recovery, and retries after restart;
+- fresh writes and database integrity after recovery.
+
+The store tests also force `SQLITE_FULL` through a temporary database page limit.
+This checks transaction rollback and readiness recovery without filling the host disk.
 
 Air excludes `*_test.go` from reload triggers, so changing only tests does not
 restart the live collector. Run the test suite explicitly.

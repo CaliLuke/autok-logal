@@ -200,3 +200,28 @@ func TestCanonicalPayloadPreservesArraysAndIntegerPrecision(t *testing.T) {
 		t.Fatalf("canonicalization changed values: %s", canonical)
 	}
 }
+
+func TestRedactionRecognizesCredentialSpellings(t *testing.T) {
+	attributes := pcommon.NewMap()
+	sensitive := []string{"apiKey", "accessToken", "clientSecret", "http.request.header.proxy-authorization", "db_password", "auth.client_secret", "token"}
+	safe := []string{"gen_ai.usage.input_tokens", "output_token_count", "tokenizer", "token_count"}
+	for _, key := range sensitive {
+		attributes.PutStr(key, "must-not-persist")
+	}
+	for _, key := range safe {
+		attributes.PutInt(key, 42)
+	}
+	redactMap(attributes)
+	for _, key := range sensitive {
+		value, _ := attributes.Get(key)
+		if value.Str() != "[REDACTED]" {
+			t.Errorf("credential %s persisted", key)
+		}
+	}
+	for _, key := range safe {
+		value, _ := attributes.Get(key)
+		if value.Type() != pcommon.ValueTypeInt || value.Int() != 42 {
+			t.Errorf("token count %s redacted", key)
+		}
+	}
+}

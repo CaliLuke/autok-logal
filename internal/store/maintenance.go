@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 const (
@@ -28,16 +30,10 @@ func (s *Store) maintenanceLoop(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			maintenanceCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			err := s.Maintain(maintenanceCtx, time.Now())
+			_ = s.Maintain(maintenanceCtx, time.Now())
 			cancel()
 			if ctx.Err() != nil {
 				return
-			}
-			if err != nil {
-				s.setOperationalError(err)
-			} else {
-				s.lastError.Store(nil)
-				s.ready.Store(true)
 			}
 		case <-s.stop:
 			return
@@ -45,26 +41,54 @@ func (s *Store) maintenanceLoop(ctx context.Context) {
 	}
 }
 
-func (s *Store) Maintain(ctx context.Context, now time.Time) error {
-	s.mu.Lock()
+func (s *Store) Maintain(ctx context.Context, now time.Time) (err error) {
+	if err := s.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer s.mu.Unlock()
+	// Publish recovery before releasing the writer. Otherwise a subsequent write
+	// failure can be overwritten by the previous maintenance result.
+	defer func() {
+		if s.closing.Load() {
+			return
+		}
+		if err != nil {
+			// Cleanup is time-bounded work. Exhausting its budget does not mean
+			// the writer failed; capacity checks still govern every admission.
+			// Preserve any earlier storage failure until maintenance succeeds.
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				s.setOperationalError(err)
+			}
+		} else {
+			s.lastError.Store(nil)
+			s.ready.Store(true)
+		}
+	}()
 	if s.db == nil || s.closing.Load() {
 		return errors.New("store is closed")
 	}
 	cutoff := now.Add(-time.Duration(s.cfg.RetentionHours) * time.Hour).UnixNano()
-	for _, signal := range []struct {
-		table   string
-		deleted *atomic.Uint64
-	}{{"otel_logs", &s.deletedLogs}, {"otel_spans", &s.deletedSpans}, {"otel_metric_points", &s.deletedMetrics}} {
-		result, err := s.db.ExecContext(ctx, `DELETE FROM `+signal.table+` WHERE id IN (SELECT id FROM `+signal.table+` WHERE received_at_unix_nano < ? ORDER BY received_at_unix_nano LIMIT 5000)`, cutoff)
-		if err != nil {
-			return err
+	// Drain backlogs in fair rounds; the maintenance context bounds total work.
+	for {
+		more := false
+		for _, signal := range []struct {
+			table   string
+			deleted *atomic.Uint64
+		}{{"otel_logs", &s.deletedLogs}, {"otel_spans", &s.deletedSpans}, {"otel_metric_points", &s.deletedMetrics}} {
+			result, err := s.db.ExecContext(ctx, `DELETE FROM `+signal.table+` WHERE id IN (SELECT id FROM `+signal.table+` WHERE received_at_unix_nano < ? ORDER BY received_at_unix_nano LIMIT 5000)`, cutoff)
+			if err != nil {
+				return err
+			}
+			n, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			signal.deleted.Add(uint64(n))
+			more = more || n == 5000
 		}
-		n, err := result.RowsAffected()
-		if err != nil {
-			return err
+		if !more {
+			break
 		}
-		signal.deleted.Add(uint64(n))
 	}
 	// Reclaim existing free pages before deciding whether to evict fresh data.
 	if err := incrementalVacuum(ctx, s.db); err != nil {
@@ -200,13 +224,27 @@ func (s *Store) deletePressureBatch(ctx context.Context) error {
 }
 
 func (s *Store) Snapshot(ctx context.Context) Snapshot {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	snapshot := s.OperationalSnapshot()
+	if err := s.mu.LockContext(ctx); err != nil {
+		snapshot.SnapshotError = err.Error()
+		return snapshot
+	}
+	defer s.mu.Unlock()
+	snapshot = s.OperationalSnapshot()
 	if s.db != nil {
-		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_metric_points`).Scan(&snapshot.OldestMetric)
-		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_logs`).Scan(&snapshot.OldestLog)
-		_ = s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM otel_spans`).Scan(&snapshot.OldestSpan)
+		for _, query := range []struct {
+			table  string
+			oldest *int64
+		}{
+			{"otel_metric_points", &snapshot.OldestMetric},
+			{"otel_logs", &snapshot.OldestLog},
+			{"otel_spans", &snapshot.OldestSpan},
+		} {
+			if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(received_at_unix_nano),0) FROM `+query.table).Scan(query.oldest); err != nil {
+				snapshot.SnapshotError = err.Error()
+				break
+			}
+		}
 	}
 	return snapshot
 }
@@ -264,4 +302,16 @@ func (s *Store) admissionErrorLocked() error {
 		return errors.New("WAL is above readiness limit")
 	}
 	return nil
+}
+
+// Invalid records and client cancellations do not mean that SQLite is unhealthy.
+// Actual storage failures stop admission until maintenance verifies recovery.
+func (s *Store) recordWriteError(err error) {
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) {
+		switch sqliteErr.Code {
+		case sqlite3.ErrIoErr, sqlite3.ErrFull, sqlite3.ErrCorrupt, sqlite3.ErrNotADB, sqlite3.ErrReadonly, sqlite3.ErrCantOpen:
+			s.setOperationalError(err)
+		}
+	}
 }

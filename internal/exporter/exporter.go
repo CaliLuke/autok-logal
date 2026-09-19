@@ -410,22 +410,25 @@ func redactValue(value pcommon.Value) {
 }
 
 func isSensitiveKey(key string) bool {
+	// Compare whole terminal names, including common camelCase/header spellings.
+	// Never match "token" as a substring: token counts are useful telemetry.
 	normalized := strings.ToLower(strings.TrimSpace(key))
 	segments := strings.FieldsFunc(normalized, func(r rune) bool {
 		return r == '.' || r == '/' || r == ':'
 	})
-	terminal := normalized
-	if len(segments) > 0 {
-		terminal = segments[len(segments)-1]
+	if len(segments) == 0 {
+		return false
 	}
-	terminal = strings.ReplaceAll(terminal, "-", "_")
+	terminal := strings.NewReplacer("-", "", "_", "").Replace(segments[len(segments)-1])
 	switch terminal {
-	case "authorization", "cookie", "set_cookie", "password", "passwd", "secret", "api_key":
+	case "authorization", "proxyauthorization", "cookie", "setcookie",
+		"password", "passwd", "secret", "apikey", "clientsecret", "token",
+		"accesstoken", "refreshtoken", "idtoken", "sessiontoken", "csrftoken":
 		return true
 	}
 	normalized = strings.NewReplacer(".", "_", "-", "_", "/", "_", ":", "_").Replace(normalized)
-	for _, credential := range []string{"access_token", "refresh_token", "id_token", "session_token", "csrf_token"} {
-		if normalized == credential || strings.HasSuffix(normalized, "_"+credential) {
+	for _, credential := range []string{"password", "passwd", "secret", "api_key", "access_token", "refresh_token", "id_token", "session_token", "csrf_token"} {
+		if strings.HasSuffix(normalized, "_"+credential) {
 			return true
 		}
 	}
@@ -458,4 +461,12 @@ func nonZeroSpanID(id pcommon.SpanID) []byte {
 		return nil
 	}
 	return append([]byte(nil), id[:]...)
+}
+
+func (cfg *Config) Validate() error {
+	var id component.ID
+	if err := id.UnmarshalText([]byte(cfg.Store)); err != nil || id.Type() != store.Type {
+		return errors.New("store must identify a logal_store extension")
+	}
+	return nil
 }

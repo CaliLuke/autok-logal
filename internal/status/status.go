@@ -12,6 +12,7 @@ import (
 
 	"github.com/CaliLuke/autok-logal/internal/store"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componentstatus"
 	"go.opentelemetry.io/collector/extension"
 	"go.opentelemetry.io/collector/extension/extensioncapabilities"
 	"go.opentelemetry.io/collector/extension/extensionmiddleware"
@@ -29,6 +30,7 @@ const (
 )
 
 type Config struct {
+	Store       string `mapstructure:"store"`
 	Endpoint    string `mapstructure:"endpoint"`
 	MaxInFlight int    `mapstructure:"max_in_flight_requests"`
 }
@@ -56,10 +58,12 @@ type activityState struct {
 }
 
 func NewFactory() extension.Factory {
-	return extension.NewFactory(Type, func() component.Config { return &Config{Endpoint: "127.0.0.1:13133", MaxInFlight: 8} }, func(_ context.Context, settings extension.Settings, cfg component.Config) (extension.Extension, error) {
+	return extension.NewFactory(Type, func() component.Config {
+		return &Config{Store: "logal_store", Endpoint: "127.0.0.1:13133", MaxInFlight: 8}
+	}, func(_ context.Context, settings extension.Settings, cfg component.Config) (extension.Extension, error) {
 		config := *cfg.(*Config)
-		if config.MaxInFlight <= 0 {
-			return nil, fmt.Errorf("max_in_flight_requests must be positive")
+		if err := config.Validate(); err != nil {
+			return nil, err
 		}
 		return &Status{
 			cfg:        config,
@@ -73,7 +77,7 @@ func NewFactory() extension.Factory {
 
 func (s *Status) Start(_ context.Context, host component.Host) error {
 	var err error
-	s.store, err = store.Find(host, "logal_store")
+	s.store, err = store.Find(host, s.storeID().String())
 	if err != nil {
 		return err
 	}
@@ -91,7 +95,9 @@ func (s *Status) Start(_ context.Context, host component.Host) error {
 	}
 	go func() {
 		if serveErr := s.server.Serve(s.listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			s.pipelineReady.Store(false)
 			s.log().Error("Logal status server stopped unexpectedly", zap.Error(serveErr))
+			componentstatus.ReportStatus(host, componentstatus.NewFatalErrorEvent(serveErr))
 		}
 	}()
 	s.reporting.Store(true)
@@ -126,7 +132,7 @@ func (s *Status) Shutdown(ctx context.Context) error {
 
 func (s *Status) Ready() error                 { s.pipelineReady.Store(true); return nil }
 func (s *Status) NotReady() error              { s.pipelineReady.Store(false); return nil }
-func (s *Status) Dependencies() []component.ID { return []component.ID{component.NewID(store.Type)} }
+func (s *Status) Dependencies() []component.ID { return []component.ID{s.storeID()} }
 
 func (s *Status) GetHTTPHandler(context.Context) (extensionmiddleware.WrapHTTPHandlerFunc, error) {
 	return func(_ context.Context, next http.Handler) (http.Handler, error) {
@@ -192,7 +198,9 @@ func (s *Status) handleReady(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Status) handleStatus(w http.ResponseWriter, r *http.Request) {
-	snapshot := s.store.Snapshot(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+	defer cancel()
+	snapshot := s.store.Snapshot(ctx)
 	response := map[string]any{"ready": s.pipelineReady.Load() && snapshot.Ready && s.inFlight.Load() < int64(s.cfg.MaxInFlight), "pipeline_ready": s.pipelineReady.Load(), "in_flight": s.inFlight.Load(), "limit": s.cfg.MaxInFlight, "rejected_requests": s.rejected.Load(), "store": snapshot}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
@@ -288,3 +296,25 @@ var _ extensioncapabilities.Dependent = (*Status)(nil)
 var _ extensionmiddleware.HTTPServer = (*Status)(nil)
 
 var _ extensionmiddleware.GRPCServer = (*Status)(nil)
+
+func (s *Status) storeID() component.ID {
+	id := component.NewID(store.Type)
+	if s.cfg.Store != "" {
+		_ = id.UnmarshalText([]byte(s.cfg.Store)) // Checked by Config.Validate.
+	}
+	return id
+}
+
+func (cfg *Config) Validate() error {
+	if cfg.MaxInFlight <= 0 {
+		return errors.New("max_in_flight_requests must be positive")
+	}
+	if _, _, err := net.SplitHostPort(cfg.Endpoint); err != nil {
+		return fmt.Errorf("invalid status endpoint: %w", err)
+	}
+	var id component.ID
+	if err := id.UnmarshalText([]byte(cfg.Store)); err != nil || id.Type() != store.Type {
+		return errors.New("store must identify a logal_store extension")
+	}
+	return nil
+}

@@ -117,6 +117,9 @@ func TestLogConstraintFailureRollsBackWholeBatch(t *testing.T) {
 	if err := s.InsertLogs(context.Background(), records); err == nil {
 		t.Fatal("invalid body silently dropped")
 	}
+	if !s.OperationalSnapshot().Ready {
+		t.Fatal("invalid record marked store unhealthy")
+	}
 	var count int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM otel_logs`).Scan(&count); err != nil {
 		t.Fatal(err)

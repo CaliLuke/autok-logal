@@ -57,6 +57,7 @@ type SpanRecord struct {
 }
 
 type Snapshot struct {
+	SnapshotError    string `json:"snapshot_error,omitempty"`
 	OldestMetric     int64  `json:"oldest_metric_received_unix_nano"`
 	CommittedMetrics uint64 `json:"committed_metric_points"`
 	DeletedMetrics   uint64 `json:"deleted_metric_points"`
@@ -79,7 +80,7 @@ type Store struct {
 	deletedMetrics    atomic.Uint64
 	cfg               Config
 	db                *sql.DB
-	mu                sync.Mutex
+	mu                contextMutex
 	stop              chan struct{}
 	done              chan struct{}
 	lockFile          *os.File
@@ -104,11 +105,8 @@ func NewFactory() extension.Factory {
 }
 
 func (s *Store) Start(context.Context, component.Host) error {
-	if s.cfg.Path == "" {
-		return errors.New("logal store path is required")
-	}
-	if s.cfg.RetentionHours <= 0 || s.cfg.RetentionHours > int((1<<63-1)/int64(time.Hour)) {
-		return errors.New("retention_hours must be positive and fit in a time.Duration")
+	if err := s.cfg.Validate(); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(s.cfg.Path), 0o700); err != nil {
 		return fmt.Errorf("create data directory: %w", err)
@@ -180,12 +178,15 @@ func (s *Store) probeWritePath() error {
 	return tx.Rollback()
 }
 
-func (s *Store) InsertLogs(ctx context.Context, records []LogRecord) error {
+func (s *Store) InsertLogs(ctx context.Context, records []LogRecord) (err error) {
 	if !s.ready.Load() {
 		return errors.New("store is not ready")
 	}
-	s.mu.Lock()
+	if err := s.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer s.mu.Unlock()
+	defer func() { s.recordWriteError(err) }()
 	if err := s.admissionErrorLocked(); err != nil {
 		return err
 	}
@@ -218,12 +219,15 @@ func (s *Store) InsertLogs(ctx context.Context, records []LogRecord) error {
 	return nil
 }
 
-func (s *Store) InsertSpans(ctx context.Context, records []SpanRecord) error {
+func (s *Store) InsertSpans(ctx context.Context, records []SpanRecord) (err error) {
 	if !s.ready.Load() {
 		return errors.New("store is not ready")
 	}
-	s.mu.Lock()
+	if err := s.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer s.mu.Unlock()
+	defer func() { s.recordWriteError(err) }()
 	if err := s.admissionErrorLocked(); err != nil {
 		return err
 	}
@@ -287,4 +291,14 @@ func Find(host component.Host, configured string) (*Store, error) {
 		}
 	}
 	return nil, fmt.Errorf("store extension %q not found", configured)
+}
+
+func (cfg *Config) Validate() error {
+	if cfg.Path == "" {
+		return errors.New("logal store path is required")
+	}
+	if cfg.RetentionHours <= 0 || cfg.RetentionHours > int((1<<63-1)/int64(time.Hour)) {
+		return errors.New("retention_hours must be positive and fit in a time.Duration")
+	}
+	return nil
 }

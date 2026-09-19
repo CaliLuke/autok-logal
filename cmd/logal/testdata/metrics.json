@@ -1,0 +1,176 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "contract"
+            }
+          },
+          {
+            "key": "authorization",
+            "value": {
+              "stringValue": "Bearer metric-resource-secret"
+            }
+          }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": {
+            "name": "contract.metrics",
+            "attributes": [
+              {
+                "key": "password",
+                "value": {
+                  "stringValue": "metric-scope-secret"
+                }
+              }
+            ]
+          },
+          "metrics": [
+            {
+              "name": "contract.gauge",
+              "unit": "1",
+              "gauge": {
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "0",
+                    "timeUnixNano": "0",
+                    "asInt": "1",
+                    "flags": 1,
+                    "attributes": [
+                      {
+                        "key": "session_token",
+                        "value": {
+                          "stringValue": "metric-point-secret"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.usage.input_tokens",
+                        "value": {
+                          "intValue": "123"
+                        }
+                      }
+                    ],
+                    "exemplars": [
+                      {
+                        "filteredAttributes": [
+                          {
+                            "key": "refresh_token",
+                            "value": {
+                              "stringValue": "metric-exemplar-secret"
+                            }
+                          }
+                        ],
+                        "timeUnixNano": "0",
+                        "asDouble": 1.5,
+                        "traceId": "00112233445566778899aabbccddeeff",
+                        "spanId": "0011223344556677"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "contract.sum",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "10",
+                    "timeUnixNano": "20",
+                    "asInt": "7"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "contract.histogram",
+              "histogram": {
+                "aggregationTemporality": 2,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "10",
+                    "timeUnixNano": "20",
+                    "count": "3",
+                    "sum": 6,
+                    "min": 1,
+                    "max": 3,
+                    "explicitBounds": [
+                      1,
+                      2
+                    ],
+                    "bucketCounts": [
+                      "1",
+                      "1",
+                      "1"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "contract.exponential_histogram",
+              "exponentialHistogram": {
+                "aggregationTemporality": 2,
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "10",
+                    "timeUnixNano": "20",
+                    "count": "2",
+                    "sum": 3,
+                    "min": 1,
+                    "max": 2,
+                    "scale": 1,
+                    "zeroCount": "1",
+                    "zeroThreshold": 0.1,
+                    "positive": {
+                      "offset": -1,
+                      "bucketCounts": [
+                        "1"
+                      ]
+                    },
+                    "negative": {
+                      "offset": 1,
+                      "bucketCounts": [
+                        "0"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "name": "contract.summary",
+              "summary": {
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "10",
+                    "timeUnixNano": "20",
+                    "count": "2",
+                    "sum": 3,
+                    "quantileValues": [
+                      {
+                        "quantile": 0.5,
+                        "value": 1
+                      },
+                      {
+                        "quantile": 0.99,
+                        "value": 2
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

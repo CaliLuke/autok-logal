@@ -37,6 +37,9 @@ func (s *Store) acquireOwnership() error {
 		if err == nil && !info.Mode().IsRegular() {
 			return fmt.Errorf("refuse non-regular telemetry file %s", candidate)
 		}
+		if err == nil && info.Sys().(*syscall.Stat_t).Nlink > 1 {
+			return fmt.Errorf("refuse hard-linked telemetry file %s", candidate)
+		}
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -73,12 +76,15 @@ func rejectOpenDescriptors(path string) error {
 	}
 	// One scan checks all database files. Avoid DNS/service lookups and repeated
 	// process-table scans, which can exceed the startup deadline on busy hosts.
-	inspectionCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	inspectionCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	args := append([]string{"-nP", "-t", "--"}, candidates...)
 	output, err := exec.CommandContext(inspectionCtx, "lsof", args...).Output()
 	if len(output) > 0 {
 		return fmt.Errorf("refuse telemetry database already open by another process: %s", path)
+	}
+	if inspectionCtx.Err() != nil {
+		return fmt.Errorf("inspect open descriptors for %s: %w", path, inspectionCtx.Err())
 	}
 	var exitErr *exec.ExitError
 	if err != nil && (!errors.As(err, &exitErr) || exitErr.ExitCode() != 1) {
