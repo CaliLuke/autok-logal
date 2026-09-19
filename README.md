@@ -5,9 +5,10 @@ Point an app's standard OTLP exporters at Logal to inspect its instrumentation w
 Logal accepts OTLP/gRPC and OTLP/HTTP and stores recent telemetry in SQLite.
 The Auto-K runner uses `../otel.debug.sqlite` by default.
 
-Version 0.4.0 adds a read-only inspection CLI for services, logs, traces, and metrics.
+Version 0.5.0 adds `clear` to remove stored telemetry between test runs without restarting the collector.
+The read-only inspection CLI from 0.4.0 remains available for services, logs, traces, and metrics.
 It retains schema version 7 from 0.3.1, including the dedicated `otel_metric_points` table.
-Upgrades from 0.3.1 need no schema reset. The next start still resets older disposable databases, including schemas 5 and 6.
+Upgrades from 0.3.1 or 0.4.0 need no schema reset. The next start still resets older disposable databases, including schemas 5 and 6.
 
 Logal focuses on OpenTelemetry instrumentation: resources, scopes, attributes, span context, and metric semantics.
 It uses disposable storage with bounded queries. Dashboards, alerting, proprietary ingestion formats, and production storage are outside its scope.
@@ -346,6 +347,7 @@ Successful maintenance restores readiness. Invalid records and canceled requests
 | `/livez` | The status HTTP server is alive. It does not prove ingestion is safe. |
 | `/readyz` | Pipelines and store are ready, disk/WAL limits are safe, and the request concurrency limit is not saturated. |
 | `/status` | JSON details for pipeline readiness, in-flight/limit/middleware-rejected requests, store counters, sizes, oldest records, free disk, and the latest operational error. |
+| `POST /clear` | Local administration endpoint used by `logal clear` to delete stored telemetry. Requires explicit confirmation and the matching database path. |
 
 The status extension uses its `store` configuration field to select the store extension.
 The default is `logal_store`. Unexpected status-server failure stops the collector.
@@ -379,6 +381,40 @@ The activity line includes committed/deleted logs, spans, and metric points, rej
 active requests, readiness, database/WAL bytes, and free disk.
 Middleware rejections, unready state, and store errors produce warnings.
 Individual records never appear in the console output.
+
+## Clearing telemetry between test runs
+
+The CLI and running collector must use version 0.5.0 or later. After upgrading an older collector, restart it once.
+
+Use `clear` to delete stored logs, spans, and metric points while the collector stays running:
+
+```bash
+bin/logal clear --db ../otel.debug.sqlite --confirm --json
+```
+
+The command uses `LOGAL_DB_PATH` when `--db` is absent.
+Its health endpoint defaults to `127.0.0.1:13133`, or `LOGAL_HEALTH_ENDPOINT` when set.
+For a different collector, specify its health endpoint:
+
+```bash
+bin/logal clear --db /path/to/otel.debug.sqlite --endpoint 127.0.0.1:23133 --confirm
+```
+
+The collector verifies the database path and deletes all three signals in one transaction.
+The CLI never opens the database read-write. Missing confirmation or a mismatched path prevents deletion.
+The response includes `database`, `cleared_at`, `deleted_logs`, `deleted_spans`, and `deleted_metric_points`.
+An empty database returns zero deletion counts.
+
+Clearing removes committed telemetry. In-flight exports and later exports can add data afterward, including records with older event timestamps.
+For isolated test runs, stop the previous workload and drain its SDK exporters before clearing. Start the next workload after `clear` succeeds.
+Clearing invalidates old pagination offsets, and row IDs can repeat. Start fresh queries after each clear.
+Metric rates need a new baseline after clearing.
+
+The database schema, collector process, and lifetime status counters remain intact. Deletion counters increase by the removed row counts.
+Normal maintenance reclaims file space; clearing does not promise immediate file shrinkage.
+The server bounds deletion to five seconds and rolls back the transaction on failure.
+The CLI never retries a clear request automatically. If a connection fails, inspect telemetry before retrying.
+The command requires a running collector. `reset-db` remains available for deleting a stopped disposable database.
 
 ## Querying OpenTelemetry data
 

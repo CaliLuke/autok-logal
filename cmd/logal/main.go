@@ -50,7 +50,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 	switch args[1] {
 	case "serve":
 		return runCollector(ctx, args[2:], out, errOut)
-	case "services", "spans", "logs", "trace", "metrics", "sql", "reset-db", "help", "--help", "-h", "--version", "-v":
+	case "services", "spans", "logs", "trace", "metrics", "sql", "clear", "reset-db", "help", "--help", "-h", "--version", "-v":
 		return newCLI(in, out, errOut).Run(ctx, args)
 	default:
 		if strings.HasPrefix(args[1], "-") || args[1] == "components" || args[1] == "validate" || args[1] == "featuregate" || args[1] == "print-config" {

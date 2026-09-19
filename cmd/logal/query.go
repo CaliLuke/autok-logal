@@ -33,6 +33,7 @@ func newCLI(in io.Reader, out, errOut io.Writer) *cli.Command {
 					return runCollector(ctx, c.Args().Slice(), out, errOut)
 				}},
 			newResetCommand(),
+			newClearCommand(),
 		},
 	}
 }

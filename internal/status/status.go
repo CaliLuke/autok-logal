@@ -88,6 +88,7 @@ func (s *Status) Start(_ context.Context, host component.Host) error {
 	})
 	mux.HandleFunc("/readyz", s.handleReady)
 	mux.HandleFunc("/status", s.handleStatus)
+	mux.HandleFunc("/clear", s.handleClear)
 	s.server = &http.Server{Handler: mux, ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 	s.listener, err = net.Listen("tcp", s.cfg.Endpoint)
 	if err != nil {
