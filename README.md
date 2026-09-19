@@ -5,9 +5,9 @@ Point an app's standard OTLP exporters at Logal to inspect its instrumentation w
 Logal accepts OTLP/gRPC and OTLP/HTTP and stores recent telemetry in SQLite.
 The Auto-K runner uses `../otel.debug.sqlite` by default.
 
-Version 0.3.1 restores metrics support removed in 0.3.0. Schema version 7 contains
-the dedicated `otel_metric_points` table. The next start resets older disposable
-databases, including all telemetry in schema versions 5 and 6.
+Version 0.4.0 adds a read-only inspection CLI for services, logs, traces, and metrics.
+It retains schema version 7 from 0.3.1, including the dedicated `otel_metric_points` table.
+Upgrades from 0.3.1 need no schema reset. The next start still resets older disposable databases, including schemas 5 and 6.
 
 Logal focuses on OpenTelemetry instrumentation: resources, scopes, attributes, span context, and metric semantics.
 It uses disposable storage with bounded queries. Dashboards, alerting, proprietary ingestion formats, and production storage are outside its scope.
