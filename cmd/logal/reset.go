@@ -1,32 +1,33 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
 	"github.com/CaliLuke/autok-logal/internal/store"
-	"github.com/spf13/cobra"
+	"github.com/urfave/cli/v3"
 )
 
-func newResetCommand() *cobra.Command {
-	var path string
-	var confirmed bool
-	command := &cobra.Command{
-		Use:   "reset-db --path PATH --confirm",
-		Short: "Delete a stopped, disposable Logal database under its ownership lock",
-		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, _ []string) error {
-			if !confirmed {
+func newResetCommand() *cli.Command {
+	return &cli.Command{
+		Name: "reset-db", Usage: "Delete a stopped, disposable Logal database under its ownership lock",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "path", Usage: "Disposable database path"},
+			&cli.BoolFlag{Name: "confirm", Usage: "Confirm database deletion"},
+		},
+		Action: func(_ context.Context, command *cli.Command) error {
+			if command.Args().Len() != 0 {
+				return errors.New("reset-db does not accept positional arguments")
+			}
+			if !command.Bool("confirm") {
 				return errors.New("reset-db requires --confirm to delete the disposable database")
 			}
-			if err := store.Reset(path); err != nil {
+			if err := store.Reset(command.String("path")); err != nil {
 				return err
 			}
-			_, err := fmt.Fprintf(command.OutOrStdout(), "Removed disposable Logal database files at %s\n", path)
+			_, err := fmt.Fprintf(command.Root().Writer, "Removed disposable Logal database files at %s\n", command.String("path"))
 			return err
 		},
 	}
-	command.Flags().StringVar(&path, "path", "", "Disposable database path")
-	command.Flags().BoolVar(&confirmed, "confirm", false, "Confirm database deletion")
-	return command
 }

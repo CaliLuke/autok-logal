@@ -1,15 +1,17 @@
 # autok-logal
 
-Logal is Auto-K's local OpenTelemetry collector for logs, traces, and metrics.
-It accepts OTLP/gRPC and OTLP/HTTP telemetry from local applications and persists a recent,
-queryable window in `../otel.debug.sqlite`.
+Logal collects and inspects OpenTelemetry logs, traces, and metrics during local app development.
+Point an app's standard OTLP exporters at Logal to inspect its instrumentation without a local SigNoz deployment.
+Logal accepts OTLP/gRPC and OTLP/HTTP and stores recent telemetry in SQLite.
+The Auto-K runner uses `../otel.debug.sqlite` by default.
 
 Version 0.3.1 restores metrics support removed in 0.3.0. Schema version 7 contains
 the dedicated `otel_metric_points` table. The next start resets older disposable
 databases, including all telemetry in schema versions 5 and 6.
 
-This is disposable development infrastructure, not a production observability
-platform. The most important rule is:
+Logal focuses on OpenTelemetry instrumentation: resources, scopes, attributes, span context, and metric semantics.
+It uses disposable storage with bounded queries. Dashboards, alerting, proprietary ingestion formats, and production storage are outside its scope.
+The most important rule is:
 
 > Logal is the only process allowed to open `otel.debug.sqlite` read-write.
 > Applications export OTLP logs, traces, and metrics. They never write the database.
@@ -77,6 +79,7 @@ are:
 | `cmd/logal/main.go` | Registers only the OTLP receiver, Logal exporters, store, and status extension. |
 | `config/local.yaml` | Wires the logs, traces, and metrics pipelines and binds their local endpoints. |
 | `internal/exporter` | Validates OTLP values, redacts sensitive fields, extracts query columns, and creates one SQLite record per log, span, or metric point. |
+| `internal/query` | Runs bounded read-only queries and formats telemetry values for the CLI. |
 | `internal/store` | Owns SQLite, verifies schema ownership, serializes writes, deduplicates records, enforces capacity, and performs retention. |
 | `internal/status` | Exposes health/status endpoints, limits concurrent requests, counts rejections, and emits operational summaries. |
 | `scripts/run` | Applies defaults and launches Air, or runs a direct one-shot binary when watching is disabled. |
@@ -377,74 +380,233 @@ active requests, readiness, database/WAL bytes, and free disk.
 Middleware rejections, unready state, and store errors produce warnings.
 Individual records never appear in the console output.
 
-## Querying telemetry
+## Querying OpenTelemetry data
 
-Always use SQLite read-only mode. From `autok-logal`:
-
-```bash
-# Recent logs
-sqlite3 -readonly -column -header ../otel.debug.sqlite \
-  "SELECT received_at_unix_nano, severity_text, service_name, component, op,
-          json_extract(body_json, '$.string') AS message
-   FROM otel_logs ORDER BY id DESC LIMIT 20"
-
-# Errors from the last five minutes
-sqlite3 -readonly -column -header ../otel.debug.sqlite \
-  "SELECT received_at_unix_nano, service_name, severity_text, body_json
-   FROM otel_logs
-   WHERE severity_number >= 17
-     AND received_at_unix_nano >= unixepoch('now', '-5 minutes') * 1000000000
-   ORDER BY id DESC LIMIT 50"
-
-# Recent spans with readable IDs
-sqlite3 -readonly -column -header ../otel.debug.sqlite \
-  "SELECT service_name, name, hex(trace_id) AS trace_id, hex(span_id) AS span_id,
-          start_time_unix_nano, end_time_unix_nano
-   FROM otel_spans ORDER BY id DESC LIMIT 20"
-
-# Correlate logs with a trace
-sqlite3 -readonly -column -header ../otel.debug.sqlite \
-  "SELECT service_name, severity_text, component, op, body_json
-   FROM otel_logs
-   WHERE hex(trace_id)=upper('00112233445566778899aabbccddeeff')
-   ORDER BY id"
-```
-
-Use `payload_json` when the indexed columns do not contain the field you need.
-Inspect `.schema otel_logs`, `.schema otel_spans`, and `.schema otel_metric_points`
-for the current schema.
+Build the CLI from `autok-logal`:
 
 ```bash
-# Recent metric points
-sqlite3 -readonly -column -header ../otel.debug.sqlite \
-  "SELECT service_name, metric_name, metric_type, number_int, number_double,
-          aggregate_count, aggregate_sum
-   FROM otel_metric_points ORDER BY id DESC LIMIT 20"
+go build -o bin/logal ./cmd/logal
+export LOGAL_DB_PATH="$(cd .. && pwd)/otel.debug.sqlite"
+
+# Check which services export each signal.
+bin/logal services --json
+
+# Find failed server spans and inspect their trace.
+bin/logal spans --service checkout --kind server --status error --min-duration 100ms --json
+bin/logal trace 00112233445566778899aabbccddeeff --json
+
+# Match resource attributes separately from log attributes.
+bin/logal logs --service checkout --resource deployment.environment.name=development \
+  --attribute http.request.method=GET --level error --json
+
+# Discover instruments, then inspect their individual streams.
+bin/logal metrics list --service checkout --json
+bin/logal metrics series --name http.server.request.duration --json
+bin/logal metrics points --name http.server.request.duration --type histogram --json
+
+# Calculate rates within each monotonic sum stream.
+bin/logal metrics rate --name app.requests --service checkout --time event --since 10m --json
 ```
 
-Metric payloads retain aggregation settings, buckets, quantiles, and exemplars.
-Non-finite numeric values remain in the payload. Their numeric query columns
-contain SQL `NULL`. Aggregate counts use text to preserve unsigned 64-bit values.
+`metrics` without a subcommand behaves as `metrics points`.
+Metric flags work before or after the subcommand.
+Use `logal COMMAND --help` or `logal metrics rate --help` for the complete argument list.
+Existing collector startup flags remain available. `logal serve --help` shows those flags.
+
+### OpenTelemetry filters and output
+
+| Argument | Meaning |
+| --- | --- |
+| `--service NAME` | Exact resource `service.name`. |
+| `--resource KEY=VALUE` | Match a resource attribute. Repeat to require multiple attributes. |
+| `--scope NAME`, `--scope-version VERSION` | Match the instrumentation scope. |
+| `--attribute KEY=VALUE` | Match a log, span, or metric point attribute. Repeat to require multiple attributes. |
+| `--since DURATION_OR_TIMESTAMP` | Inclusive start of the query window. Default: 15 minutes ago. |
+| `--until TIMESTAMP` | Exclusive end of the query window, in RFC3339 format. |
+| `--time received\|event` | Select the timestamps used for filtering. Default: receipt time. |
+| `--payload` | Include the stored, redacted OTLP JSON envelope for each record. |
+| `--columns NAME,NAME` | Select output columns and their order, before the byte limit applies. Works with JSON. |
+| `--list-columns` | List available columns without reading telemetry. Built-in views need no database. |
+| `--details` | Show all fields and complete cells in human output. JSON already includes all fields. |
+| `--include-empty` | Restore empty fields within the selected view, in text and JSON output. |
+
+Attribute filters preserve scalar types. `http.response.status_code=200` matches an OTLP integer.
+`success=true` matches a boolean. Bare values such as `http.request.method=GET` match strings.
+Use shell quotes around `'build.version="200"'` to match a numeric string.
+Use `200.0` to match a double. Arrays, maps, and null are not scalar filter values.
+Commas remain part of a value. Repeated flags require every filter to match.
+
+Receipt time answers when Logal received a record. Event time uses the log timestamp, span start, or metric point timestamp.
+Event-time filters do not substitute receipt time when an OTLP timestamp is missing.
+Rate calculations always use metric timestamps, regardless of the filter time basis.
+
+`spans` supports `--name`, `--kind`, `--status`, `--min-duration`, `--trace-id`, and `--span-id`.
+`logs` supports `--level`, `--trace-id`, and `--span-id`.
+`trace TRACE_ID` returns correlated spans and logs in event-time order, with receipt time as a fallback.
+Span results include status, duration, events, links, resources, scopes, and attributes.
+Log results include severity, body, event name, span context, resources, scopes, and attributes.
+Custom application attributes use the same filters as semantic-convention attributes.
+
+### Metric semantics
+
+`metrics list` groups metric descriptors and reports series counts.
+`metrics series` includes point attributes and reports each stream's point count and timestamp range.
+`metrics points` exposes units, descriptions, temporality, monotonicity, flags, and attributes.
+It also exposes explicit buckets, exponential buckets, summary quantiles, and exemplars.
+Exemplar trace IDs can be passed to `logal trace`.
+Use `--name`, `--type`, and `--temporality` to select metrics.
+
+Discovery preserves resource and scope attributes, schema URLs, metric names, units, types, and aggregation properties.
+Individual streams also preserve point attributes. Integer and double samples can belong to the same stream.
+Description changes do not create new streams.
+Resource attributes distinguish service instances when the producer supplies `service.instance.id`.
+`services` summarizes signal counts by `service.name`; metric queries retain the complete resource identity.
+Metric views show a stable `resource_id` derived from resource attributes and the resource schema URL.
+This identifier distinguishes resources that share a service name. It is a Logal fingerprint, not an OTLP attribute.
+Metric lists also show `last_received_at` to help identify resources that still send data.
+Use `--resource-id ID` to select that resource in metric lists, series, points, or rates.
+Full resource and stream identity still determine groups and rates.
+
+```bash
+bin/logal metrics list --name nodejs.eventloop.time
+bin/logal metrics points --name nodejs.eventloop.time --resource-id RESOURCE_ID
+```
+
+`metrics rate` requires `--name` and calculates a rate for each valid monotonic sum interval:
+
+- Delta sums divide the reported value by the reported interval duration.
+- Cumulative sums use consecutive points from the same stream and start timestamp.
+- The first cumulative point in the selected window has no baseline and returns no rate.
+- Changed start timestamps report a reset. Later points can establish a new rate.
+- Zero-duration points contribute no rate but can establish a cumulative baseline.
+- Missing values, absent-value flags, invalid timestamps, decreases, overlaps, and ambiguous timestamps return no rate with a `rate_reason`.
+- Delta gaps appear as `gap_seconds`. Rates cover reported intervals and do not fill those gaps.
+
+Valid rates include `interval_start`, `interval_end`, `delta_value`, and `rate_per_second` in JSON and detailed output.
+The rate unit is the original metric unit per second.
+Gauges and non-monotonic sums return `not_monotonic_sum` instead of an invented counter rate.
+An unspecified aggregation temporality also returns no rate.
+Calculations use the entire selected window before output pagination.
+
+Histogram output preserves the original OTLP buckets and temporality.
+The CLI does not add overlapping cumulative histograms, average summary quantiles, or invent window percentiles.
+It does not merge series across different resources or point attributes.
+These rules follow the [OpenTelemetry metrics data model](https://opentelemetry.io/docs/specs/otel/metrics/data-model/).
+
+### Query bounds and advanced inspection
+
+`--db PATH` overrides `LOGAL_DB_PATH`. Queries require an existing database with the current Logal schema.
+They never create, reset, or repair a database. They work while the collector runs and after it stops.
+The CLI opens SQLite read-only and closes its connection before it prints results.
+All commands use urfave/cli v3, apart from the Collector's native startup command handling.
+
+Queries return at most 100 rows by default and have a two-second deadline.
+Use `--limit`, `--timeout`, and `--max-bytes` to adjust the limits.
+Maximum values are 10,000 output rows, 30 seconds, and 16 MiB. The default output budget is 1 MiB.
+Discovery and rate queries can scan more input rows than the output limit. The deadline also bounds that work.
+
+By default, rows omit nulls, empty strings, and empty arrays or objects.
+Numeric zero and boolean false remain visible. Nested OTLP attributes and payloads remain intact.
+The `columns` list includes fields present in at least one row on the current page.
+Text output leaves a cell blank when that row omits its field.
+Use `--include-empty` to restore empty fields and every selected column, including for SQL queries.
+Use `--details --include-empty` for the complete human view.
+
+```bash
+bin/logal metrics points --name http.server.request.duration --json --include-empty
+```
+
+With `--json`, stdout contains one object with `columns`, `rows`, `count`, and `truncated`.
+Truncated results also contain `truncation_reason` and `next_offset`.
+Pass that offset through `--offset` to read another page, up to an offset of 1,000,000.
+Pages use separate snapshots. Ingestion, retention, and relative time windows can shift their boundaries.
+Use fixed `--since` and `--until` timestamps for repeatable time windows. Offsets are not durable cursors.
+An empty result is a successful query.
+
+Built-in commands format timestamps as UTC RFC3339 strings and IDs as lowercase hexadecimal strings.
+Resource and point attributes retain their OTLP AnyValue structure, including integer strings.
+The result envelope is a CLI inspection format. `--payload` contains the stored OTLP envelope.
+Human output defaults to an aligned summary with readable span kinds, statuses, and severity labels.
+Trace summaries show elapsed milliseconds from the earliest trace event and each span's duration.
+Trace rows use `kind` to identify spans or logs; `span_kind` retains the OTLP span kind.
+Span rows also include `status_message` when the producer supplies it.
+The timeline preserves event order and parent IDs. It does not infer causality from timestamps.
+Summary cells longer than 64 characters have a visible truncation marker.
+`--details` restores all fields and complete values. JSON values are never shortened.
+Control characters remain escaped in every human view.
+
+Use `--list-columns` to discover the names accepted by `--columns` for each view.
+Built-in views need no database, trace ID, or metric name for this option.
+Add `--payload` to include the optional payload column. Metric discovery summaries do not support payloads.
+JSON column discovery returns an object with a `columns` array.
+For SQL, supply a database and query. Logal prepares the query without evaluating its rows.
+
+```bash
+bin/logal trace --list-columns
+bin/logal metrics rate --list-columns --json
+bin/logal metrics points --list-columns --payload
+bin/logal sql --query 'SELECT service_name, count(*) AS logs FROM otel_logs GROUP BY service_name' --list-columns
+```
+
+```bash
+bin/logal metrics list --columns metric_name,metric_type,unit,series_count --json
+bin/logal trace 00112233445566778899aabbccddeeff --details
+```
+Errors return exit status 1. With `--json`, stderr contains an `error` object with `code` and `message`.
+A query failure does not print partial results.
+
+The `sql` command remains an escape hatch for inspecting stored OTLP fields:
+
+```bash
+bin/logal sql --query 'SELECT service_name, count(*) AS n FROM otel_logs GROUP BY service_name' --json
+bin/logal sql --file query.sql --json
+```
+
+It accepts one SELECT or WITH query, limited to 64 KiB. `--file -` reads SQL from stdin.
+A SQLite authorizer rejects writes and extension loading.
+SQL preserves scalar values and encodes blobs as hexadecimal strings.
+Use an explicit `ORDER BY` for repeatable SQL pagination.
+Direct SQLite inspection must also use read-only mode:
+
+```bash
+sqlite3 -readonly "$LOGAL_DB_PATH" '.schema otel_metric_points'
+```
+
+Non-finite metric values remain in the payload. Their numeric query columns contain SQL `NULL`.
+Aggregate counts use text to preserve unsigned 64-bit values.
 
 ## Adding or checking a telemetry producer
 
-A local producer should:
+Configure the app's OpenTelemetry SDK with a standard OTLP exporter. For SDKs that support these environment variables:
 
-1. Export OTLP/HTTP logs, traces, and metrics to `/v1/logs`, `/v1/traces`, and `/v1/metrics`.
-2. Set resource `service.name` to a stable application name.
-3. Populate `request.id`, `autok.product.id`, `app.component`, and `event.name`
-   when those correlation fields exist.
-4. Treat `503` as temporary not-ready/saturation and retry with bounded
-   backoff. Treat malformed or oversized payload responses as producer bugs.
-5. Never open the SQLite database read-write.
+```bash
+export OTEL_SERVICE_NAME=checkout
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=development,service.instance.id=checkout-local
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+```
+
+These variables configure an exporter; they do not install instrumentation or enable disabled signal exporters.
+The SDK still needs its log, trace, and metric providers and exporters.
+Existing signal-specific endpoint variables take precedence over the general endpoint.
+OTLP/HTTP uses `/v1/logs`, `/v1/traces`, and `/v1/metrics`. OTLP/gRPC uses port 4317.
+Exporter configuration follows the [OpenTelemetry OTLP exporter specification](https://opentelemetry.io/docs/specs/otel/protocol/exporter/).
+
+A local producer must:
+
+1. Export each signal through its standard OTLP endpoint.
+2. Set resource `service.name` and identify distinct service instances when needed.
+3. Use OpenTelemetry semantic conventions and retain useful custom attributes.
+4. Retry temporary unavailable responses with bounded backoff.
+5. Send malformed payload and invalid-value failures to the app's diagnostic output.
+6. Keep all SQLite write access inside Logal.
 
 Verify the producer in three places:
 
 ```bash
 curl -fsS http://127.0.0.1:13133/readyz
 curl -sS http://127.0.0.1:13133/status | jq '.store, .rejected_requests'
-sqlite3 -readonly ../otel.debug.sqlite \
-  "SELECT service_name, COUNT(*) FROM otel_logs GROUP BY service_name"
+bin/logal services --db ../otel.debug.sqlite --json
 ```
 
 Allow up to 10 seconds for the aggregated activity line; committed rows should
@@ -500,7 +662,8 @@ The contract suite checks:
 - malformed JSON/protobuf, unsupported content types, and request size limits;
 - invalid batches and span conflicts, with no partial persistence;
 - abrupt process termination, WAL recovery, and retries after restart;
-- fresh writes and database integrity after recovery.
+- fresh writes and database integrity after recovery;
+- CLI queries while running and stopped, trace correlation, filters, and structured errors.
 
 The store tests also force `SQLITE_FULL` through a temporary database page limit.
 This checks transaction rollback and readiness recovery without filling the host disk.
