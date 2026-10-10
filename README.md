@@ -67,7 +67,9 @@ logal_sqlite exporters: validate + redact + normalize
 logal_store: ownership + transactions + retention + disk limits
         │
         ▼
-../otel.debug.sqlite (WAL mode, one read-write owner)
+LOGAL_DB_PATH (WAL mode, one read-write owner)
+  stack: ../.tmp/dev-stack/logal-<HTTP port>/otel.debug.sqlite
+  standalone default: ../otel.debug.sqlite
 
 Health/status: 127.0.0.1:13133/{livez,readyz,status}
 ```
@@ -403,9 +405,10 @@ The CLI and running collector must use version 0.5.0 or later. After upgrading a
 Use `clear` to delete stored logs, spans, and metric points while the collector stays running:
 
 ```bash
-bin/logal clear --db ../otel.debug.sqlite --confirm --json
+bin/logal clear --db ../.tmp/dev-stack/logal-4318/otel.debug.sqlite --confirm --json
 ```
 
+The example targets the default stack database. For a standalone session, use `../otel.debug.sqlite`.
 The command uses `LOGAL_DB_PATH` when `--db` is absent.
 Its health endpoint defaults to `127.0.0.1:13133`, or `LOGAL_HEALTH_ENDPOINT` when set.
 For a different collector, specify its health endpoint:
@@ -436,7 +439,10 @@ Build the CLI from `autok-logal`:
 
 ```bash
 go build -o bin/logal ./cmd/logal
-export LOGAL_DB_PATH="$(cd .. && pwd)/otel.debug.sqlite"
+
+# Newest stack database, else the standalone default at the monorepo root.
+LOGAL_DB_PATH=$(sh -c 'ls -t ../.tmp/dev-stack/logal-*/otel.debug.sqlite 2>/dev/null | head -n 1')
+export LOGAL_DB_PATH="${LOGAL_DB_PATH:-../otel.debug.sqlite}"
 
 # Check which services export each signal.
 bin/logal services --json
@@ -656,7 +662,7 @@ Verify the producer in three places:
 ```bash
 curl -fsS http://127.0.0.1:13133/readyz
 curl -sS http://127.0.0.1:13133/status | jq '.store, .rejected_requests'
-bin/logal services --db ../otel.debug.sqlite --json
+bin/logal services --db ../.tmp/dev-stack/logal-4318/otel.debug.sqlite --json  # standalone: ../otel.debug.sqlite
 ```
 
 Allow up to 10 seconds for the aggregated activity line; committed rows should
@@ -732,8 +738,8 @@ There is another writer or a lingering reader. Do not delete the lock while a
 process is alive.
 
 ```bash
-lsof ../otel.debug.sqlite ../otel.debug.sqlite-wal ../otel.debug.sqlite-shm \
-  ../otel.debug.sqlite.lock
+db=../.tmp/dev-stack/logal-4318/otel.debug.sqlite  # standalone: ../otel.debug.sqlite
+lsof "$db" "$db-wal" "$db-shm" "$db.lock"
 lsof -nP -iTCP:4317 -iTCP:4318 -iTCP:13133 -sTCP:LISTEN
 ```
 
