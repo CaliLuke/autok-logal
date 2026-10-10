@@ -24,6 +24,9 @@ export LOGAL_OTLP_HTTP_ENDPOINT="${LOGAL_OTLP_HTTP_ENDPOINT:-127.0.0.1:${LOGAL_O
 export LOGAL_HEALTH_ENDPOINT="${LOGAL_HEALTH_ENDPOINT:-127.0.0.1:${LOGAL_HEALTH_PORT:-${AUTOK_LOGAL_HEALTH_PORT:-13133}}}"
 export LOGAL_MAX_IN_FLIGHT_REQUESTS="${LOGAL_MAX_IN_FLIGHT_REQUESTS:-8}"
 WATCH="${AUTOK_LOGAL_WATCH:-1}"
+# Each Air process owns its build output and removes only that output on exit.
+# Keep this beside .tmp/air: an older runner can still remove that directory.
+AIR_DIR=".tmp/air-$$"
 
 if [[ "${1:-}" == "--dry-run" ]]; then
 	test -f "$CONFIG_PATH"
@@ -34,7 +37,7 @@ if [[ "${1:-}" == "--dry-run" ]]; then
 	if [[ "$WATCH" == "0" ]]; then
 		echo "binary=$BINARY_PATH"
 	else
-		echo "binary=$ROOT_DIR/.tmp/air/logal"
+		echo "binary=$ROOT_DIR/$AIR_DIR/logal"
 	fi
 	echo "config=$CONFIG_PATH"
 	echo "db=$LOGAL_DB_PATH"
@@ -59,7 +62,11 @@ if [[ "$WATCH" != "0" ]]; then
 		echo "  go install github.com/air-verse/air@latest" >&2
 		exit 1
 	fi
-	exec air -color never -c "$ROOT_DIR/.air.toml" -- --config "$CONFIG_PATH" "$@"
+	exec air -color never -c "$ROOT_DIR/.air.toml" \
+		-tmp_dir "$AIR_DIR" \
+		-build.cmd "go build -o ./$AIR_DIR/logal ./cmd/logal" \
+		-build.entrypoint "./$AIR_DIR/logal" \
+		-- --config "$CONFIG_PATH" "$@"
 fi
 
 mkdir -p "$(dirname "$BINARY_PATH")"

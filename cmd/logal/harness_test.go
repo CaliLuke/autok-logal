@@ -74,6 +74,11 @@ type collector struct {
 
 func startCollector(t *testing.T, dbPath string) *collector {
 	t.Helper()
+	return startCollectorCommand(t, dbPath, collectorBinary)
+}
+
+func startCollectorCommand(t *testing.T, dbPath, command string) *collector {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("collector subprocess tests disabled by -short")
 	}
@@ -121,8 +126,12 @@ func startCollector(t *testing.T, dbPath string) *collector {
 			}
 			t.Fatal(err)
 		}
-		c.cmd = exec.Command(collectorBinary, "--config", filepath.Join(projectRoot, "config/local.yaml"))
+		c.cmd = exec.Command(command)
+		if command == collectorBinary {
+			c.cmd.Args = append(c.cmd.Args, "--config", filepath.Join(projectRoot, "config/local.yaml"))
+		}
 		overridesEnv := map[string]string{
+			"AUTOK_LOGAL_WATCH": "1", "AUTOK_LOGAL_CONFIG_PATH": filepath.Join(projectRoot, "config/local.yaml"),
 			"LOGAL_DB_PATH": dbPath, "LOGAL_RETENTION_HOURS": "48", "LOGAL_MAX_IN_FLIGHT_REQUESTS": "8",
 			"LOGAL_OTLP_GRPC_ENDPOINT": c.grpcAddress, "LOGAL_OTLP_HTTP_ENDPOINT": c.httpAddress, "LOGAL_HEALTH_ENDPOINT": c.healthAddress,
 		}

@@ -3,7 +3,7 @@
 Logal collects and inspects OpenTelemetry logs, traces, and metrics during local app development.
 Point an app's standard OTLP exporters at Logal to inspect its instrumentation without a local SigNoz deployment.
 Logal accepts OTLP/gRPC and OTLP/HTTP and stores recent telemetry in SQLite.
-The Auto-K runner uses `../otel.debug.sqlite` by default.
+The standalone runner uses `../otel.debug.sqlite` by default. Each Auto-K stack uses its own database under `.tmp/`.
 
 Version 0.5.0 adds `clear` to remove stored telemetry between test runs without restarting the collector.
 The read-only inspection CLI from 0.4.0 remains available for services, logs, traces, and metrics.
@@ -40,7 +40,7 @@ curl -fsS http://127.0.0.1:13133/readyz
 curl -fsS http://127.0.0.1:13133/status
 ```
 
-The database is created at the monorepo root by default:
+Standalone sessions create the database at the monorepo root by default:
 
 ```text
 autok-deploy/
@@ -158,8 +158,21 @@ The parent [`stack.toml`](../stack.toml) declares Logal with:
 - command `./autok-logal/scripts/run`;
 - ports `4317`, `4318`, and `13133`;
 - readiness `/readyz` and liveness `/livez`;
-- a 30-second initial readiness timeout;
+- a two-minute initial readiness timeout;
 - automatic restart if the service process exits unexpectedly.
+
+Each stack runs a separate Logal process. The stack assigns available ports and
+sets `LOGAL_DB_PATH` to `.tmp/dev-stack/logal-<assigned HTTP port>/otel.debug.sqlite`.
+The blacknas stack uses `.tmp/blacknas-stack/` instead. These paths are relative
+to the monorepo root. The database persists across service restarts. If a later
+stack session assigns a different HTTP port, it uses a different database.
+Existing telemetry in the root database remains available through the CLI.
+
+Use the assigned port from the stack dashboard to inspect that stack:
+
+```bash
+autok-logal/bin/logal services --db .tmp/dev-stack/logal-4318/otel.debug.sqlite --json
+```
 
 Air remains the long-running child of the stack service. A successful rebuild
 sends Logal `SIGINT`, gives it up to ten seconds to shut down gracefully, and
@@ -167,7 +180,8 @@ then starts the new binary. A compilation failure leaves the last good process
 running. Restart the Logal service once after changing `.air.toml` or
 `scripts/run`; Air cannot replace its own launcher configuration in place. In
 the stack TUI, select Logal and press `r` to restart it. Press `q` or `Ctrl+C` to
-gracefully stop the complete stack.
+gracefully stop the complete stack. Each runner uses its own `.tmp/air-<PID>`
+directory, so one runner cannot overwrite or delete another runner's executable.
 
 ### Direct operation without Air
 
@@ -181,9 +195,9 @@ AUTOK_LOGAL_WATCH=0 ./scripts/run
 In direct mode, `scripts/run` rebuilds only when its tracked Go/module inputs
 are newer or changed. `AUTOK_LOGAL_BINARY_PATH` controls that binary location.
 
-Never run the stack-managed and standalone instances against the same database
-at the same time. The second process should refuse to start rather than risk
-corruption.
+Stack-managed and standalone instances can run together with separate ports
+and databases. Each database permits one Logal writer. An explicit database
+override must not point at another active instance's database.
 
 ## Configuration
 
@@ -723,8 +737,9 @@ lsof ../otel.debug.sqlite ../otel.debug.sqlite-wal ../otel.debug.sqlite-shm \
 lsof -nP -iTCP:4317 -iTCP:4318 -iTCP:13133 -sTCP:LISTEN
 ```
 
-Stop the duplicate Logal or close the read-only SQLite shell, then restart the
-service.
+Give each collector its own `LOGAL_DB_PATH` and listener endpoints. Stack
+configuration does this automatically. If a read-only SQLite shell holds the
+file open, close that shell before the restart.
 
 ### Port 4317, 4318, or 13133 is already in use
 
