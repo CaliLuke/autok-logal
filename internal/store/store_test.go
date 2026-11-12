@@ -20,6 +20,9 @@ func startTestStore(t *testing.T) *Store {
 	if err := s.Start(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
+	// Unit tests drive maintenance explicitly; integration tests exercise the loop.
+	s.maintenanceCancel()
+	<-s.done
 	t.Cleanup(func() {
 		if err := s.Shutdown(context.Background()); err != nil {
 			t.Error(err)

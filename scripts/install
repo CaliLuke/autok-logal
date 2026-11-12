@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+INSTALL_DIR="${LOGAL_INSTALL_DIR:-$HOME/.local/bin}"
+mkdir -p "$INSTALL_DIR"
+TEMP_BINARY="$(mktemp "$INSTALL_DIR/.logal-install.XXXXXX")"
+trap 'rm -f "$TEMP_BINARY"' EXIT
+cd "$ROOT_DIR"
+VERSION="$(git describe --tags --always --dirty)"
+go build -ldflags "-X main.version=$VERSION" -o "$TEMP_BINARY" ./cmd/logal
+chmod 755 "$TEMP_BINARY"
+mv -f "$TEMP_BINARY" "$INSTALL_DIR/logal"
+printf 'Installed %s (%s)\n' "$INSTALL_DIR/logal" "$VERSION"

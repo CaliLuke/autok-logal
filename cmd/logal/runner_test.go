@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -42,4 +43,28 @@ func TestRunnerIsolation(t *testing.T) {
 	}
 	exportSignals(t, second.grpcConnection(t), contractLogs(), contractTraces(), contractMetrics())
 	assertSignalCounts(t, second, 1, 1, 2)
+}
+
+func TestRunnerUsesInstalledBinaryWithoutCompiler(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "logal")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nprintf 'installed-logal\\n'\nprintf '%s\\n' \"$@\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/bash", filepath.Join(root, "scripts/run"), "--version")
+	command.Dir = dir
+	// There is no Go or Air in PATH. Running must use the installed executable
+	// even when source files are newer and no source manifest exists.
+	command.Env = []string{"PATH=" + dir + ":/usr/bin:/bin", "HOME=" + dir, "LOGAL_DB_PATH=" + filepath.Join(dir, "telemetry.sqlite")}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("runner failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "installed-logal\n--config\n"+filepath.Join(root, "config/local.yaml")+"\n--version") {
+		t.Fatalf("wrong executable or arguments: %s", output)
+	}
 }

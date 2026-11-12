@@ -2,6 +2,7 @@ extensions:
   logal_store:
     path: ${env:LOGAL_DB_PATH}
     retention_hours: ${env:LOGAL_RETENTION_HOURS}
+    max_database_bytes: ${env:LOGAL_MAX_DATABASE_BYTES:-536870912}
   logal_status:
     store: logal_store
     endpoint: ${env:LOGAL_HEALTH_ENDPOINT}

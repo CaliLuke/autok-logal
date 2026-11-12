@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -15,35 +16,68 @@ import (
 )
 
 const (
-	mainHighWater   = int64(2 << 30)
 	activeHardLimit = int64(3 << 30)
 	requestReserve  = int64(64 << 20)
 	freeDiskFloor   = uint64(5 << 30)
 	walNotReady     = int64(256 << 20)
 )
 
+// Run immediately after startup and promptly resume bounded catch-up work.
+// Each pass releases the writer before waiting, so ingestion gets a turn.
 func (s *Store) maintenanceLoop(ctx context.Context) {
 	defer close(s.done)
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
 	for {
+		maintenanceCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := s.Maintain(maintenanceCtx, time.Now())
+		cancel()
+		delay := 30 * time.Second
+		if errors.Is(err, context.DeadlineExceeded) {
+			delay = 250 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
 		select {
-		case <-ticker.C:
-			maintenanceCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			_ = s.Maintain(maintenanceCtx, time.Now())
-			cancel()
-			if ctx.Err() != nil {
-				return
-			}
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return
 		case <-s.stop:
+			timer.Stop()
 			return
 		}
 	}
 }
 
 func (s *Store) Maintain(ctx context.Context, now time.Time) (err error) {
+	started := time.Now()
+	defer func() {
+		outcome := "completed"
+		if errors.Is(err, context.DeadlineExceeded) {
+			outcome = "budget_exhausted"
+		} else if errors.Is(err, context.Canceled) {
+			outcome = "canceled"
+		} else if err != nil {
+			outcome = "failed"
+		}
+		s.maintenance.Store(&maintenanceResult{outcome: outcome, durationMS: time.Since(started).Milliseconds(), finishedAt: time.Now().UTC()})
+	}()
+
+	for {
+		more, err := s.maintainRound(ctx, now)
+		if err != nil {
+			return err
+		}
+		if !more {
+			return nil
+		}
+	}
+}
+
+// Yield the writer between rounds so catch-up cannot monopolize ingestion or
+// prevent status snapshots for the entire maintenance budget.
+func (s *Store) maintainRound(ctx context.Context, now time.Time) (more bool, err error) {
+
 	if err := s.mu.LockContext(ctx); err != nil {
-		return err
+		return false, err
 	}
 	defer s.mu.Unlock()
 	// Publish recovery before releasing the writer. Otherwise a subsequent write
@@ -65,70 +99,67 @@ func (s *Store) Maintain(ctx context.Context, now time.Time) (err error) {
 		}
 	}()
 	if s.db == nil || s.closing.Load() {
-		return errors.New("store is closed")
+		return false, errors.New("store is closed")
 	}
 	cutoff := now.Add(-time.Duration(s.cfg.RetentionHours) * time.Hour).UnixNano()
-	// Drain backlogs in fair rounds; the maintenance context bounds total work.
-	for {
-		more := false
-		for _, signal := range []struct {
-			table   string
-			deleted *atomic.Uint64
-		}{{"otel_logs", &s.deletedLogs}, {"otel_spans", &s.deletedSpans}, {"otel_metric_points", &s.deletedMetrics}} {
-			result, err := s.db.ExecContext(ctx, `DELETE FROM `+signal.table+` WHERE id IN (SELECT id FROM `+signal.table+` WHERE received_at_unix_nano < ? ORDER BY received_at_unix_nano LIMIT 5000)`, cutoff)
-			if err != nil {
-				return err
-			}
-			n, err := result.RowsAffected()
-			if err != nil {
-				return err
-			}
-			signal.deleted.Add(uint64(n))
-			more = more || n == 5000
-		}
-		if !more {
-			break
-		}
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
-	// Reclaim existing free pages before deciding whether to evict fresh data.
+	// Always reclaim prior committed deletions first. Expiration used to drain
+	// the entire budget before vacuum/checkpoint, starving physical reclamation.
 	if err := incrementalVacuum(ctx, s.db); err != nil {
-		return err
+		return false, err
 	}
 	if err := checkpoint(ctx, s.db, "PASSIVE"); err != nil {
-		return err
+		return false, err
 	}
-	for pressureIterations := 0; pressureIterations < 200; pressureIterations++ {
-		databaseBytes, activeBytes, freeBytes, walBytes := diskState(s.cfg.Path)
-		pressure := databaseBytes >= mainHighWater || activeBytes+requestReserve >= activeHardLimit || freeBytes < freeDiskFloor+uint64(requestReserve)
-		if !pressure && walBytes < walNotReady {
-			return nil
-		}
-		// A pinned reader must not cause repeated deletion while truncation fails.
+	databaseBytes, activeBytes, freeBytes, walBytes := diskState(s.cfg.Path)
+	pressure := databaseBytes > s.cfg.databaseLimit() || activeBytes+requestReserve >= activeHardLimit || freeBytes < freeDiskFloor+uint64(requestReserve)
+	if pressure || walBytes >= walNotReady {
+		// A pinned reader must not cause deletion of fresh data to grow the WAL.
 		if err := checkpoint(ctx, s.db, "TRUNCATE"); err != nil {
-			return err
+			return false, err
 		}
 		databaseBytes, activeBytes, freeBytes, _ = diskState(s.cfg.Path)
-		if databaseBytes < mainHighWater && activeBytes+requestReserve < activeHardLimit && freeBytes >= freeDiskFloor+uint64(requestReserve) {
-			return nil
-		}
+		pressure = databaseBytes > s.cfg.databaseLimit() || activeBytes+requestReserve >= activeHardLimit || freeBytes < freeDiskFloor+uint64(requestReserve)
 		var freePages int
 		if err := s.db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&freePages); err != nil {
-			return err
+			return false, err
 		}
-		if freePages == 0 {
+		if pressure && freePages == 0 {
 			before := s.deletedLogs.Load() + s.deletedSpans.Load() + s.deletedMetrics.Load()
 			if err := s.deletePressureBatch(ctx); err != nil {
-				return err
+				return false, err
 			}
 			if s.deletedLogs.Load()+s.deletedSpans.Load()+s.deletedMetrics.Load() == before {
-				return errors.New("disk pressure persists with no telemetry left to evict")
+				return false, errors.New("disk pressure persists with no telemetry left to evict")
 			}
 		}
-		if err := incrementalVacuum(ctx, s.db); err != nil {
-			return err
-		}
 	}
-	return errors.New("disk pressure persists after bounded cleanup")
+	// One small batch per signal; rotate the first signal across interrupted
+	// passes so a busy logs table cannot starve spans or metrics.
+	more = pressure
+	signals := []struct {
+		table   string
+		deleted *atomic.Uint64
+	}{
+		{"otel_logs", &s.deletedLogs}, {"otel_spans", &s.deletedSpans}, {"otel_metric_points", &s.deletedMetrics},
+	}
+	for range signals {
+		signal := signals[s.maintenanceNextSignal]
+		s.maintenanceNextSignal = (s.maintenanceNextSignal + 1) % len(signals)
+		result, err := s.db.ExecContext(ctx, `DELETE FROM `+signal.table+` WHERE id IN (SELECT id FROM `+signal.table+` WHERE received_at_unix_nano < ? ORDER BY received_at_unix_nano LIMIT 256)`, cutoff)
+		if err != nil {
+			return false, err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		signal.deleted.Add(uint64(n))
+		more = more || n > 0
+	}
+	return more, nil
 }
 
 func incrementalVacuum(ctx context.Context, db *sql.DB) error {
@@ -199,18 +230,16 @@ func (s *Store) deletePressureBatch(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, id := range logIDs {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM otel_logs WHERE id=?`, id); err != nil {
-			return err
+	for i, ids := range [][]int64{logIDs, spanIDs, metricIDs} {
+		if len(ids) == 0 {
+			continue
 		}
-	}
-	for _, id := range spanIDs {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM otel_spans WHERE id=?`, id); err != nil {
-			return err
+		table := []string{"otel_logs", "otel_spans", "otel_metric_points"}[i]
+		args := make([]any, len(ids))
+		for j, id := range ids {
+			args[j] = id
 		}
-	}
-	for _, id := range metricIDs {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM otel_metric_points WHERE id=?`, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE id IN (`+strings.TrimRight(strings.Repeat("?,", len(ids)), ",")+`)`, args...); err != nil {
 			return err
 		}
 	}
@@ -252,8 +281,13 @@ func (s *Store) Snapshot(ctx context.Context) Snapshot {
 // OperationalSnapshot returns the counters and capacity state without waiting
 // for the SQLite writer. It is intended for periodic health reporting.
 func (s *Store) OperationalSnapshot() Snapshot {
-	snapshot := Snapshot{CommittedMetrics: s.committedMetrics.Load(), DeletedMetrics: s.deletedMetrics.Load(), Ready: s.ready.Load(), CommittedLogs: s.committedLogs.Load(), CommittedSpans: s.committedSpans.Load(), DeletedLogs: s.deletedLogs.Load(), DeletedSpans: s.deletedSpans.Load()}
+	snapshot := Snapshot{MaxDatabaseBytes: s.cfg.databaseLimit(), RetentionHours: s.cfg.RetentionHours, CommittedMetrics: s.committedMetrics.Load(), DeletedMetrics: s.deletedMetrics.Load(), Ready: s.ready.Load(), CommittedLogs: s.committedLogs.Load(), CommittedSpans: s.committedSpans.Load(), DeletedLogs: s.deletedLogs.Load(), DeletedSpans: s.deletedSpans.Load()}
 	snapshot.DatabaseBytes, snapshot.ActiveBytes, snapshot.FreeBytes, snapshot.WALBytes = diskState(s.cfg.Path)
+	if result := s.maintenance.Load(); result != nil {
+		snapshot.MaintenanceOutcome = result.outcome
+		snapshot.MaintenanceDurationMS = result.durationMS
+		snapshot.MaintenanceFinishedAt = result.finishedAt
+	}
 	if lastError := s.lastError.Load(); lastError != nil {
 		snapshot.LastError = *lastError
 	}

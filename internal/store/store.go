@@ -13,6 +13,7 @@ import (
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/extension"
+	"go.uber.org/zap"
 )
 
 var Type = component.MustNewType("logal_store")
@@ -20,8 +21,9 @@ var Type = component.MustNewType("logal_store")
 var ErrSpanConflict = errors.New("span identity conflicts with committed content")
 
 type Config struct {
-	Path           string `mapstructure:"path"`
-	RetentionHours int    `mapstructure:"retention_hours"`
+	Path             string `mapstructure:"path"`
+	RetentionHours   int    `mapstructure:"retention_hours"`
+	MaxDatabaseBytes int64  `mapstructure:"max_database_bytes"`
 }
 
 type LogRecord struct {
@@ -57,50 +59,64 @@ type SpanRecord struct {
 }
 
 type Snapshot struct {
-	SnapshotError    string `json:"snapshot_error,omitempty"`
-	OldestMetric     int64  `json:"oldest_metric_received_unix_nano"`
-	CommittedMetrics uint64 `json:"committed_metric_points"`
-	DeletedMetrics   uint64 `json:"deleted_metric_points"`
-	Ready            bool   `json:"ready"`
-	DatabaseBytes    int64  `json:"database_bytes"`
-	WALBytes         int64  `json:"wal_bytes"`
-	OldestLog        int64  `json:"oldest_log_received_unix_nano"`
-	OldestSpan       int64  `json:"oldest_span_received_unix_nano"`
-	CommittedLogs    uint64 `json:"committed_logs"`
-	CommittedSpans   uint64 `json:"committed_spans"`
-	DeletedLogs      uint64 `json:"deleted_logs"`
-	DeletedSpans     uint64 `json:"deleted_spans"`
-	ActiveBytes      int64  `json:"active_bytes"`
-	FreeBytes        uint64 `json:"free_bytes"`
-	LastError        string `json:"last_error,omitempty"`
+	MaxDatabaseBytes      int64     `json:"max_database_bytes"`
+	RetentionHours        int       `json:"retention_hours"`
+	MaintenanceOutcome    string    `json:"maintenance_outcome,omitempty"`
+	MaintenanceDurationMS int64     `json:"maintenance_duration_ms"`
+	MaintenanceFinishedAt time.Time `json:"maintenance_finished_at,omitempty"`
+	SnapshotError         string    `json:"snapshot_error,omitempty"`
+	OldestMetric          int64     `json:"oldest_metric_received_unix_nano"`
+	CommittedMetrics      uint64    `json:"committed_metric_points"`
+	DeletedMetrics        uint64    `json:"deleted_metric_points"`
+	Ready                 bool      `json:"ready"`
+	DatabaseBytes         int64     `json:"database_bytes"`
+	WALBytes              int64     `json:"wal_bytes"`
+	OldestLog             int64     `json:"oldest_log_received_unix_nano"`
+	OldestSpan            int64     `json:"oldest_span_received_unix_nano"`
+	CommittedLogs         uint64    `json:"committed_logs"`
+	CommittedSpans        uint64    `json:"committed_spans"`
+	DeletedLogs           uint64    `json:"deleted_logs"`
+	DeletedSpans          uint64    `json:"deleted_spans"`
+	ActiveBytes           int64     `json:"active_bytes"`
+	FreeBytes             uint64    `json:"free_bytes"`
+	LastError             string    `json:"last_error,omitempty"`
+}
+
+type maintenanceResult struct {
+	outcome    string
+	durationMS int64
+	finishedAt time.Time
 }
 
 type Store struct {
-	committedMetrics  atomic.Uint64
-	deletedMetrics    atomic.Uint64
-	cfg               Config
-	db                *sql.DB
-	mu                contextMutex
-	stop              chan struct{}
-	done              chan struct{}
-	lockFile          *os.File
-	shutdownOnce      sync.Once
-	maintenanceRun    atomic.Bool
-	maintenanceCancel context.CancelFunc
-	closing           atomic.Bool
-	ready             atomic.Bool
-	lastError         atomic.Pointer[string]
-	committedLogs     atomic.Uint64
-	committedSpans    atomic.Uint64
-	deletedLogs       atomic.Uint64
-	deletedSpans      atomic.Uint64
+	logger                *zap.Logger
+	maintenance           atomic.Pointer[maintenanceResult]
+	maintenanceNextSignal int
+	committedMetrics      atomic.Uint64
+	deletedMetrics        atomic.Uint64
+	cfg                   Config
+	db                    *sql.DB
+	mu                    contextMutex
+	stop                  chan struct{}
+	done                  chan struct{}
+	lockFile              *os.File
+	shutdownOnce          sync.Once
+	maintenanceRun        atomic.Bool
+	maintenanceCancel     context.CancelFunc
+	closing               atomic.Bool
+	ready                 atomic.Bool
+	lastError             atomic.Pointer[string]
+	committedLogs         atomic.Uint64
+	committedSpans        atomic.Uint64
+	deletedLogs           atomic.Uint64
+	deletedSpans          atomic.Uint64
 }
 
 func NewFactory() extension.Factory {
 	return extension.NewFactory(Type, func() component.Config {
 		return &Config{RetentionHours: 48}
-	}, func(_ context.Context, _ extension.Settings, cfg component.Config) (extension.Extension, error) {
-		return &Store{cfg: *cfg.(*Config), stop: make(chan struct{}), done: make(chan struct{})}, nil
+	}, func(_ context.Context, settings extension.Settings, cfg component.Config) (extension.Extension, error) {
+		return &Store{logger: settings.Logger, cfg: *cfg.(*Config), stop: make(chan struct{}), done: make(chan struct{})}, nil
 	}, component.StabilityLevelAlpha)
 }
 
@@ -111,14 +127,14 @@ func (s *Store) Start(context.Context, component.Host) error {
 	if err := os.MkdirAll(filepath.Dir(s.cfg.Path), 0o700); err != nil {
 		return fmt.Errorf("create data directory: %w", err)
 	}
-	if err := s.acquireOwnership(); err != nil {
+	if err := s.startupPhase("ownership", s.acquireOwnership); err != nil {
 		return err
 	}
-	if err := s.openCurrentSchema(); err != nil {
+	if err := s.startupPhase("schema", s.openCurrentSchema); err != nil {
 		s.releaseOwnership()
 		return err
 	}
-	if err := s.probeWritePath(); err != nil {
+	if err := s.startupPhase("write_probe", s.probeWritePath); err != nil {
 		_ = s.db.Close()
 		s.db = nil
 		s.releaseOwnership()
@@ -130,6 +146,23 @@ func (s *Store) Start(context.Context, component.Host) error {
 	s.maintenanceRun.Store(true)
 	go s.maintenanceLoop(maintenanceCtx)
 	return nil
+}
+
+func (s *Store) startupPhase(phase string, run func() error) error {
+	logger := s.logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	logger.Info("Logal startup phase", zap.String("phase", phase), zap.String("outcome", "started"))
+	started := time.Now()
+	err := run()
+	fields := []zap.Field{zap.String("phase", phase), zap.Int64("duration_ms", time.Since(started).Milliseconds())}
+	if err != nil {
+		logger.Error("Logal startup phase", append(fields, zap.String("outcome", "failed"), zap.Error(err))...)
+	} else {
+		logger.Info("Logal startup phase", append(fields, zap.String("outcome", "completed"))...)
+	}
+	return err
 }
 
 func (s *Store) Shutdown(ctx context.Context) error {
@@ -293,7 +326,18 @@ func Find(host component.Host, configured string) (*Store, error) {
 	return nil, fmt.Errorf("store extension %q not found", configured)
 }
 
+func (cfg *Config) databaseLimit() int64 {
+	if cfg.MaxDatabaseBytes == 0 {
+		return 512 << 20
+	}
+	return cfg.MaxDatabaseBytes
+}
+
 func (cfg *Config) Validate() error {
+	if cfg.databaseLimit() < 1<<20 || cfg.databaseLimit() > activeHardLimit-requestReserve {
+		return errors.New("max_database_bytes must be between 1 MiB and the active storage safety limit")
+	}
+
 	if cfg.Path == "" {
 		return errors.New("logal store path is required")
 	}

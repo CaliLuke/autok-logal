@@ -267,11 +267,10 @@ func inspectSchema(db *sql.DB) (current bool, disposable bool, err error) {
 	if err != nil || storedSignature != actualSignature {
 		return false, true, err
 	}
-	var result string
-	if err := db.QueryRow(`PRAGMA quick_check`).Scan(&result); err != nil {
-		return false, true, err
-	}
-	return result == "ok", result != "ok", nil
+	// Startup validates ownership and schema metadata, then probes a write.
+	// A full quick_check scans retained payloads and must not block readiness.
+	// Operators can run PRAGMA quick_check through a read-only SQLite connection.
+	return true, false, nil
 }
 
 func schemaHasRequiredColumns(db *sql.DB) (bool, error) {

@@ -5,10 +5,15 @@ Point an app's standard OTLP exporters at Logal to inspect its instrumentation w
 Logal accepts OTLP/gRPC and OTLP/HTTP and stores recent telemetry in SQLite.
 The standalone runner uses `../otel.debug.sqlite` by default. Each Auto-K stack uses its own database under `.tmp/`.
 
-Version 0.5.0 adds `clear` to remove stored telemetry between test runs without restarting the collector.
-The read-only inspection CLI from 0.4.0 remains available for services, logs, traces, and metrics.
-It retains schema version 7 from 0.3.1, including the dedicated `otel_metric_points` table.
-Upgrades from 0.3.1 or 0.4.0 need no schema reset. The next start still resets older disposable databases, including schemas 5 and 6.
+Version 0.6.0 makes normal startup use an installed executable, removes the
+full retained-data integrity scan from readiness, and retains telemetry for
+48 hours or 512 MiB by default. Maintenance reclaims space during backlog
+cleanup, resumes promptly after its budget expires, and yields between rounds.
+Both limits and maintenance outcomes are visible through `/status` and activity logs.
+The `clear` command from 0.5.0 and read-only inspection CLI remain available.
+Schema version 7 is unchanged: upgrades from 0.3.1 through 0.5.0 need no reset.
+Restart the collector after upgrading. Set `AUTOK_LOGAL_WATCH=1` only when
+developing Logal itself.
 
 Logal focuses on OpenTelemetry instrumentation: resources, scopes, attributes, span context, and metric semantics.
 It uses disposable storage with bounded queries. Dashboards, alerting, proprietary ingestion formats, and production storage are outside its scope.
@@ -27,8 +32,9 @@ stack
 
 The stack starts Logal with `./autok-logal/scripts/run`, waits for
 `http://127.0.0.1:13133/readyz`, and shows Logal's collector, reload, activity,
-and shutdown output in its own pane. The runner uses Air, so changing Logal Go
-code or configuration rebuilds and restarts the process automatically.
+and shutdown output in its own pane. The runner launches the installed `logal`
+executable without compiling. Set `AUTOK_LOGAL_WATCH=1` only when developing
+Logal itself.
 
 For a standalone session:
 
@@ -85,7 +91,7 @@ are:
 | `internal/query` | Runs bounded read-only queries and formats telemetry values for the CLI. |
 | `internal/store` | Owns SQLite, verifies schema ownership, serializes writes, deduplicates records, enforces capacity, and performs retention. |
 | `internal/status` | Exposes health/status endpoints, limits concurrent requests, counts rejections, and emits operational summaries. |
-| `scripts/run` | Applies defaults and launches Air, or runs a direct one-shot binary when watching is disabled. |
+| `scripts/run` | Applies defaults and launches installed Logal; Air is an explicit development option. |
 | `cmd/logal/*_test.go` | Runs the real collector against temporary databases to check protocol handling, persistence, and recovery. |
 | `scripts/verify` | Runs static checks, race-enabled tests, a build, and the runner configuration check. |
 | `scripts/contract-test` | Runs only the collector contract tests with detailed output. |
@@ -145,7 +151,7 @@ cd autok-logal
 ./scripts/run --dry-run
 ```
 
-The output should show `runner=air`, all three listener endpoints, the
+The output should show `runner=direct`, all three listener endpoints, the
 collector config, and the database path. If `stack` itself is not installed,
 build it from the monorepo root:
 
@@ -176,26 +182,33 @@ Use the assigned port from the stack dashboard to inspect that stack:
 autok-logal/bin/logal services --db .tmp/dev-stack/logal-4318/otel.debug.sqlite --json
 ```
 
-Air remains the long-running child of the stack service. A successful rebuild
-sends Logal `SIGINT`, gives it up to ten seconds to shut down gracefully, and
-then starts the new binary. A compilation failure leaves the last good process
-running. Restart the Logal service once after changing `.air.toml` or
-`scripts/run`; Air cannot replace its own launcher configuration in place. In
-the stack TUI, select Logal and press `r` to restart it. Press `q` or `Ctrl+C` to
-gracefully stop the complete stack. Each runner uses its own `.tmp/air-<PID>`
-directory, so one runner cannot overwrite or delete another runner's executable.
-
-### Direct operation without Air
-
-Use a single process for debugging the runner, contract tests, or environments
-without Air:
+Normal startup runs the installed `logal` found on `PATH`. It does not run Go,
+compile sources, or start Air. Install a release, or install a tested checkout
+once with:
 
 ```bash
-AUTOK_LOGAL_WATCH=0 ./scripts/run
+./scripts/install  # installs atomically to ~/.local/bin/logal
 ```
 
-In direct mode, `scripts/run` rebuilds only when its tracked Go/module inputs
-are newer or changed. `AUTOK_LOGAL_BINARY_PATH` controls that binary location.
+Put `~/.local/bin` before other installation directories on `PATH` to use that
+local build. `LOGAL_INSTALL_DIR` overrides the installation directory.
+`AUTOK_LOGAL_BINARY_PATH` selects a specific installed executable. The runner
+fails with installation instructions when no executable is available; it never
+silently builds one. Restart the Logal service after installing an update.
+
+### Developing Logal itself
+
+Source watching is an explicit development option:
+
+```bash
+AUTOK_LOGAL_WATCH=1 ./scripts/run
+```
+
+Air rebuilds Go changes and gives the old collector ten seconds to shut down.
+A compilation failure leaves the last good process running. Each runner has its
+own `.tmp/air-<PID>` directory. Restart Logal after changing the launcher or Air
+configuration. In the stack TUI, select Logal and press `r`; `q` or `Ctrl+C`
+stops the complete stack.
 
 Stack-managed and standalone instances can run together with separate ports
 and databases. Each database permits one Logal writer. An explicit database
@@ -210,13 +223,14 @@ variables provide machine-specific paths, full bind endpoints, and limits:
 | --- | --- | --- |
 | `LOGAL_DB_PATH` | `<monorepo>/otel.debug.sqlite` | Destructive/disposable SQLite target; never point it at valuable data. |
 | `LOGAL_RETENTION_HOURS` | `48` | Receipt-time cutoff for every signal; must be positive. |
+| `LOGAL_MAX_DATABASE_BYTES` | `536870912` (512 MiB) | Main SQLite file retention budget; oldest records expire when either the age or size limit is reached. |
 | `LOGAL_OTLP_GRPC_ENDPOINT` | `127.0.0.1:4317` | Full OTLP/gRPC bind endpoint. |
 | `LOGAL_OTLP_HTTP_ENDPOINT` | `127.0.0.1:4318` | Full OTLP/HTTP bind endpoint. |
 | `LOGAL_HEALTH_ENDPOINT` | `127.0.0.1:13133` | Full health/status bind endpoint. |
 | `LOGAL_MAX_IN_FLIGHT_REQUESTS` | `8` | Admission limit shared by HTTP and gRPC exports. |
 | `AUTOK_LOGAL_CONFIG_PATH` | `autok-logal/config/local.yaml` | Auto-K runner configuration file. |
-| `AUTOK_LOGAL_WATCH` | `1` | Set to `0` to bypass Air. |
-| `AUTOK_LOGAL_BINARY_PATH` | `autok-logal/bin/logal` | Direct-mode binary path; ignored by Air mode. |
+| `AUTOK_LOGAL_WATCH` | `0` | Set to `1` only to develop Logal with Air. |
+| `AUTOK_LOGAL_BINARY_PATH` | `logal` on `PATH` | Installed executable; ignored by Air mode. |
 
 Port-only conveniences `LOGAL_OTLP_GRPC_PORT`, `LOGAL_OTLP_HTTP_PORT`, and
 `LOGAL_HEALTH_PORT` construct loopback defaults when the corresponding full
@@ -236,7 +250,7 @@ LOGAL_HEALTH_ENDPOINT=127.0.0.1:33133 \
 ./scripts/run
 ```
 
-Stop this standalone Air session with `Ctrl+C`. The example deliberately avoids
+Stop this standalone collector with `Ctrl+C`. The example deliberately avoids
 both the normal stack ports and the contract test's default ports.
 
 The default receiver accepts OTLP/gRPC on `127.0.0.1:4317` and OTLP/HTTP on:
@@ -266,14 +280,20 @@ On startup, the store performs this sequence before reporting ready:
 2. Refuse symlinks, non-regular files, another Logal lock holder, or any process
    with the database/WAL/SHM open.
 3. Inspect the SQLite application ID, schema version, required columns, stored
-   schema signature, and `PRAGMA quick_check` result.
+   schema signature. This metadata check does not scan retained payloads.
 4. Recreate an absent, stale, corrupt, non-SQLite, or recognized legacy Logal
    database. An untagged database qualifies only when all its tables have recognized Logal names.
    Logal refuses untagged databases with unrelated tables. The configured path remains destructive.
 5. Open SQLite in WAL mode with full synchronous writes and one connection.
 6. Execute and roll back a write probe.
 7. Start maintenance, health/status reporting, the OTLP receiver, and finally
-   mark the pipelines ready.
+   mark the pipelines ready. Each ownership, schema, and write-probe phase logs its
+   outcome and duration in milliseconds.
+
+Full integrity inspection is an explicit read-only diagnostic, not a startup
+requirement: `sqlite3 -readonly <database> 'PRAGMA quick_check;'`. Structural or
+ownership failures still prevent opening an unrelated database; corruption
+encountered during writes stops admission and is reported in `last_error`.
 
 On graceful shutdown, ingestion becomes not-ready first. Logal stops its
 reporter and HTTP status server, drains the collector lifecycle, stops
@@ -335,17 +355,31 @@ from those messages.
 
 ### Retention and capacity protection
 
-Maintenance runs every 30 seconds. It deletes expired records in batches of 5,000 per signal.
-It repeats across all three signals until the backlog is empty or the deadline expires.
-Then it performs incremental vacuuming and checkpoints the WAL. Each maintenance
-cycle has a five-second deadline. A blocked checkpoint stops pressure eviction
-until a later cycle. Logal reclaims existing free pages before it deletes fresh records.
-SQLite reports blocked checkpoints through [result rows](https://www.sqlite.org/pragma.html#pragma_wal_checkpoint).
+Retention is **48 hours or 512 MiB**, whichever is reached first. Both limits
+are configurable. Size eviction removes the oldest received telemetry across
+logs, spans, and metrics; it does not sample or disable producer instrumentation.
+The size budget includes tables and indexes in the main SQLite file. The WAL
+is separately bounded below, so total on-disk storage can temporarily exceed the
+main-file budget while writes and reclamation are in progress.
 
-Logal begins deleting the oldest telemetry under storage pressure. Current
-guardrails are:
+Maintenance starts immediately after opening the store. It reclaims previously
+freed pages and checkpoints before another round of expiration, so a large age
+backlog cannot starve physical compaction. Expiration uses 256-record batches
+and rotates across all three signals. Size eviction uses a global oldest-first
+batch of up to 5,000 records. Free pages are reclaimed before fresh data is evicted.
+Each pass has a five-second budget and releases the writer between rounds so
+ingestion and status requests can proceed during catch-up. An exhausted
+pass resumes after 250 milliseconds; an idle pass waits 30 seconds. Thus retention
+converges after downtime or a burst, rather than imposing an exact per-write file
+size limit. A pinned reader stops pressure eviction until checkpointing can proceed.
 
-- 2 GiB main-database high-water mark;
+`/status` and activity logs expose the configured limits, last maintenance outcome,
+duration, and completion time. Budget exhaustion is reported without falsely
+marking a healthy writer as failed.
+
+Storage safety guardrails remain:
+
+- configurable 512 MiB main-database retention budget by default;
 - 3 GiB admission threshold for the database/WAL/SHM, with a 64 MiB request reserve;
 - 5 GiB free-disk floor, plus the request reserve;
 - 256 MiB WAL readiness limit.
@@ -776,7 +810,7 @@ saturation intentionally makes the service not-ready.
 The last good Logal should continue running. Fix the compiler error and Air
 will retry after the next relevant change. Restart the service manually after
 editing `.air.toml` or `scripts/run` itself: select Logal in the stack and press
-`r`, or stop a standalone Air session with `Ctrl+C` and rerun `./scripts/run`.
+`r`, or stop a standalone Air session with `Ctrl+C` and rerun `AUTOK_LOGAL_WATCH=1 ./scripts/run`.
 
 ### Metrics are not appearing
 

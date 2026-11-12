@@ -265,6 +265,11 @@ func (s *Status) logActivity(previous, current activityState) {
 		zap.Uint64("requests_rejected", counterDelta(previous.rejected, current.rejected)),
 		zap.Int64("in_flight", current.inFlight),
 		zap.Int64("database_bytes", current.store.DatabaseBytes),
+		zap.Int64("max_database_bytes", current.store.MaxDatabaseBytes),
+		zap.Int("retention_hours", current.store.RetentionHours),
+		zap.String("maintenance_outcome", current.store.MaintenanceOutcome),
+		zap.Int64("maintenance_duration_ms", current.store.MaintenanceDurationMS),
+		zap.Time("maintenance_finished_at", current.store.MaintenanceFinishedAt),
 		zap.Int64("wal_bytes", current.store.WALBytes),
 		zap.Uint64("free_bytes", current.store.FreeBytes),
 	}

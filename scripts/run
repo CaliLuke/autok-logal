@@ -13,7 +13,10 @@ absolute_path() {
 	fi
 }
 
-BINARY_PATH="$(absolute_path "${AUTOK_LOGAL_BINARY_PATH:-$ROOT_DIR/bin/logal}")"
+BINARY_PATH="${AUTOK_LOGAL_BINARY_PATH:-$(command -v logal || true)}"
+if [[ -n "$BINARY_PATH" ]]; then
+	BINARY_PATH="$(absolute_path "$BINARY_PATH")"
+fi
 CONFIG_PATH="$(absolute_path "${AUTOK_LOGAL_CONFIG_PATH:-$ROOT_DIR/config/local.yaml}")"
 
 LOGAL_DB_PATH="$(absolute_path "${LOGAL_DB_PATH:-${AUTOK_LOGAL_DB_PATH:-$AUTOK_ROOT/otel.debug.sqlite}}")"
@@ -22,11 +25,18 @@ export LOGAL_RETENTION_HOURS="${LOGAL_RETENTION_HOURS:-${AUTOK_LOGAL_RETENTION_H
 export LOGAL_OTLP_GRPC_ENDPOINT="${LOGAL_OTLP_GRPC_ENDPOINT:-127.0.0.1:${LOGAL_OTLP_GRPC_PORT:-4317}}"
 export LOGAL_OTLP_HTTP_ENDPOINT="${LOGAL_OTLP_HTTP_ENDPOINT:-127.0.0.1:${LOGAL_OTLP_HTTP_PORT:-${AUTOK_LOGAL_OTLP_PORT:-4318}}}"
 export LOGAL_HEALTH_ENDPOINT="${LOGAL_HEALTH_ENDPOINT:-127.0.0.1:${LOGAL_HEALTH_PORT:-${AUTOK_LOGAL_HEALTH_PORT:-13133}}}"
+export LOGAL_MAX_DATABASE_BYTES="${LOGAL_MAX_DATABASE_BYTES:-536870912}"
 export LOGAL_MAX_IN_FLIGHT_REQUESTS="${LOGAL_MAX_IN_FLIGHT_REQUESTS:-8}"
-WATCH="${AUTOK_LOGAL_WATCH:-1}"
+WATCH="${AUTOK_LOGAL_WATCH:-0}"
 # Each Air process owns its build output and removes only that output on exit.
 # Keep this beside .tmp/air: an older runner can still remove that directory.
 AIR_DIR=".tmp/air-$$"
+
+if [[ "$WATCH" == "0" && ! -x "$BINARY_PATH" ]]; then
+	echo "An installed logal is required. Install Logal or run $ROOT_DIR/scripts/install once." >&2
+	echo "Set AUTOK_LOGAL_WATCH=1 only when developing Logal itself." >&2
+	exit 1
+fi
 
 if [[ "${1:-}" == "--dry-run" ]]; then
 	test -f "$CONFIG_PATH"
@@ -45,6 +55,7 @@ if [[ "${1:-}" == "--dry-run" ]]; then
 	echo "otlp_http_endpoint=$LOGAL_OTLP_HTTP_ENDPOINT"
 	echo "health_endpoint=$LOGAL_HEALTH_ENDPOINT"
 	echo "max_in_flight_requests=$LOGAL_MAX_IN_FLIGHT_REQUESTS"
+	echo "max_database_bytes=$LOGAL_MAX_DATABASE_BYTES"
 	if [[ "$WATCH" == "0" ]]; then
 		echo "runner=direct"
 	else
@@ -69,31 +80,4 @@ if [[ "$WATCH" != "0" ]]; then
 		-- --config "$CONFIG_PATH" "$@"
 fi
 
-mkdir -p "$(dirname "$BINARY_PATH")"
-needs_build=false
-SOURCE_MANIFEST="${BINARY_PATH}.sources"
-build_inputs=()
-while IFS= read -r input; do
-  build_inputs+=("$input")
-done < <(
-  find "$ROOT_DIR" \( -path "$ROOT_DIR/.git" -o -path "$ROOT_DIR/bin" \) -prune -o \
-    -type f \( -name '*.go' -o -name 'go.mod' -o -name 'go.sum' \) -print | sort
-)
-if [[ ! -x "$BINARY_PATH" ]]; then
-  needs_build=true
-elif [[ ! -f "$SOURCE_MANIFEST" ]] || ! cmp -s <(printf '%s\n' "${build_inputs[@]}") "$SOURCE_MANIFEST"; then
-  needs_build=true
-else
-  for input in "${build_inputs[@]}"; do
-    if [[ "$input" -nt "$BINARY_PATH" ]]; then
-      needs_build=true
-      break
-    fi
-  done
-fi
-
-if [[ "$needs_build" == true ]]; then
-  go build -o "$BINARY_PATH" ./cmd/logal
-  printf '%s\n' "${build_inputs[@]}" > "$SOURCE_MANIFEST"
-fi
 exec "$BINARY_PATH" --config "$CONFIG_PATH" "$@"
